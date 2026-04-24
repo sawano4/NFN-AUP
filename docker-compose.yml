@@ -1,0 +1,128 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nfn
+      POSTGRES_PASSWORD: nfn
+      POSTGRES_DB: nfn
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/init.sql
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.auth_service.app.main:app", "--host", "0.0.0.0", "--port", "8101"]
+    ports:
+      - "8101:8101"
+    depends_on:
+      - postgres
+      - redis
+
+  source-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.source_service.app.main:app", "--host", "0.0.0.0", "--port", "8102"]
+    ports:
+      - "8102:8102"
+    depends_on:
+      - postgres
+      - redis
+
+  mobile-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.mobile_service.app.main:app", "--host", "0.0.0.0", "--port", "8103"]
+    ports:
+      - "8103:8103"
+    depends_on:
+      - postgres
+      - redis
+
+  admin-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.admin_service.app.main:app", "--host", "0.0.0.0", "--port", "8104"]
+    ports:
+      - "8104:8104"
+    depends_on:
+      - postgres
+      - redis
+
+  operator-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.operator_service.app.main:app", "--host", "0.0.0.0", "--port", "8105"]
+    ports:
+      - "8105:8105"
+    depends_on:
+      - postgres
+      - redis
+
+  alert-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.alert_service.app.main:app", "--host", "0.0.0.0", "--port", "8106"]
+    ports:
+      - "8106:8106"
+    depends_on:
+      - postgres
+      - redis
+
+  document-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.document_service.app.main:app", "--host", "0.0.0.0", "--port", "8107"]
+    ports:
+      - "8107:8107"
+    depends_on:
+      - minio
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "uvicorn", "backend.services.notification_service.app.main:app", "--host", "0.0.0.0", "--port", "8108"]
+    ports:
+      - "8108:8108"
+    depends_on:
+      - mailpit
+
+volumes:
+  postgres_data:
+  minio_data:
+
