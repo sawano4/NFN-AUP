@@ -366,6 +366,15 @@ h2 {
   box-shadow: var(--shadow);
 }
 
+.sla-panel.warning {
+  border-color: #f1d49a;
+}
+
+.sla-panel.critical {
+  border-color: #f2b0a4;
+  box-shadow: 0 10px 28px rgba(198, 70, 50, 0.1);
+}
+
 .sla-header {
   display: flex;
   justify-content: space-between;
@@ -402,6 +411,46 @@ h2 {
   display: grid;
   grid-template-columns: 1.15fr 1fr 1fr;
   gap: 14px;
+}
+
+.sla-highlight-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.sla-highlight {
+  padding: 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+}
+
+.sla-highlight strong,
+.sla-highlight span {
+  display: block;
+}
+
+.sla-highlight strong {
+  font-size: 1.45rem;
+  font-weight: 650;
+}
+
+.sla-highlight span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.sla-highlight.warning {
+  background: #fff8ed;
+  border-color: #f1d49a;
+}
+
+.sla-highlight.critical {
+  background: #fff0ed;
+  border-color: #f2c2b9;
 }
 
 .sla-block {
@@ -581,6 +630,77 @@ select:focus {
 
 .bdc-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.audit-summary {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.audit-summary span {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #edf3ee;
+  color: var(--green-strong);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.audit-summary span.danger {
+  color: var(--red);
+  background: #fff0ed;
+}
+
+.audit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.audit-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--green);
+  background: var(--field);
+}
+
+.audit-card.warning {
+  border-left-color: var(--amber);
+  background: #fff8ed;
+}
+
+.audit-card.critical {
+  border-left-color: var(--red);
+  background: #fff0ed;
+}
+
+.audit-card strong,
+.audit-card span {
+  display: block;
+}
+
+.audit-card small {
+  color: var(--muted);
+}
+
+.audit-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.audit-meta span {
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.75);
+  color: var(--ink);
+  font-size: 0.74rem;
+  font-weight: 650;
 }
 
 .bdc-card {
@@ -911,7 +1031,9 @@ pre {
   .grid.two,
   .bdc-grid,
   .qr-layout,
+  .audit-grid,
   .sla-grid,
+  .sla-highlight-grid,
   .login-content {
     grid-template-columns: 1fr;
   }

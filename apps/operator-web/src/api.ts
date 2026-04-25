@@ -120,6 +120,32 @@ export type QrScanResult = {
   store_verified: boolean;
   decoded_payload: Record<string, unknown>;
   record: Record<string, unknown>;
+  audit?: OperatorAuditRecord | null;
+};
+
+export type OperatorAuditRecord = {
+  audit_id: string;
+  actor: string;
+  role?: string | null;
+  site_id?: string | null;
+  site_name?: string | null;
+  module: string;
+  direction: 'entry' | 'output' | 'qr_scan' | 'internal';
+  action: string;
+  ref_type: string;
+  ref_id: string;
+  lot_ids: string[];
+  bdc_id?: string | null;
+  qr_step?: string | null;
+  qr_payload?: string | null;
+  integrity_hash?: string | null;
+  previous_hash?: string | null;
+  weight_kg?: number | null;
+  delta_pct?: number | null;
+  sla_state: 'ok' | 'warning' | 'critical';
+  sla_label?: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
 };
 
 export type PolicyStatus = {
@@ -139,6 +165,20 @@ export type PolicyStatus = {
     age_hours: number;
     max_hours: number;
   }[];
+  bdc_deadlines: {
+    bdc_id: string;
+    kind: string;
+    destination_stage?: string | null;
+    lot_ids: string[];
+    hours_remaining: number;
+    sla_state: 'ok' | 'warning' | 'critical';
+    expected_delivery_at: string;
+  }[];
+  audit_summary: {
+    entry_count: number;
+    output_count: number;
+    qr_scan_count: number;
+  };
 };
 
 export type Tokens = {
@@ -268,6 +308,13 @@ export const api = {
   },
   scanQr(token: string, body: unknown) {
     return request<QrScanResult>('/operator/qr/scan', { method: 'POST', token, body });
+  },
+  ingestQr(token: string, body: unknown) {
+    return request<QrScanResult>('/operator/qr/ingest', { method: 'POST', token, body });
+  },
+  audits(token: string, module?: string) {
+    const suffix = module ? `?module=${encodeURIComponent(module)}` : '';
+    return request<OperatorAuditRecord[]>(`/operator/audits${suffix}`, { token });
   },
   async reportCsv(token: string, scope: string) {
     const response = await fetch(`${API_BASE_URL}/operator/reports/${encodeURIComponent(scope)}.csv`, {

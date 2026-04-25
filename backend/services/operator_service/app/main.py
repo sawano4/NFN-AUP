@@ -18,6 +18,7 @@ from backend.packages.nfn_shared.contracts import (
     LotView,
     OperatorSiteCreate,
     OperatorSiteView,
+    OperatorAuditRecord,
     PurityCertificateView,
     QrScanRequest,
     QrScanResult,
@@ -78,6 +79,21 @@ def create_operator_user(payload: UserCreate, current_user: dict = Depends(requi
 @app.post("/qr/scan", response_model=QrScanResult)
 def scan_qr(payload: QrScanRequest, current_user: dict = Depends(require_roles(Role.DEPOT, Role.LAUNDRY, Role.T1, Role.T2, Role.ADMIN))) -> QrScanResult:
     return QrScanResult(**platform_state.scan_qr_payload(payload))
+
+
+@app.post("/qr/ingest", response_model=QrScanResult)
+def ingest_qr(payload: QrScanRequest, current_user: dict = Depends(require_roles(Role.DEPOT, Role.LAUNDRY, Role.T1, Role.T2, Role.ADMIN))) -> QrScanResult:
+    return QrScanResult(**platform_state.ingest_qr_payload(payload, current_user["email"], current_user["role"]))
+
+
+@app.get("/audits", response_model=list[OperatorAuditRecord])
+def list_operator_audits(
+    module: str | None = None,
+    direction: str | None = None,
+    current_user: dict = Depends(require_roles(Role.DEPOT, Role.LAUNDRY, Role.T1, Role.T2, Role.ADMIN)),
+) -> list[OperatorAuditRecord]:
+    site_id = None if current_user["role"] == Role.ADMIN.value else _user_site_id(current_user)
+    return [OperatorAuditRecord(**item) for item in platform_state.list_operator_audits(site_id=site_id, module=module, direction=direction)]
 
 
 @app.get("/policies")

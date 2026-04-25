@@ -22,7 +22,7 @@ import {
   UserRound,
   Waves,
 } from 'lucide-react';
-import { AlertRecord, api, BdcRecord, demoUsers, OperatorSite, PolicyStatus, QrScanResult, Role, StockLot, Tokens, TraceabilityEvent, UserProfile } from './api';
+import { AlertRecord, api, BdcRecord, demoUsers, OperatorAuditRecord, OperatorSite, PolicyStatus, QrScanResult, Role, StockLot, Tokens, TraceabilityEvent, UserProfile } from './api';
 
 type View = 'depot' | 'laundry' | 'transformer' | 'admin';
 
@@ -37,6 +37,7 @@ type DashboardData = {
   sites: OperatorSite[];
   users: UserProfile[];
   policies: PolicyStatus | null;
+  audits: OperatorAuditRecord[];
 };
 
 const emptyData: DashboardData = {
@@ -50,6 +51,7 @@ const emptyData: DashboardData = {
   sites: [],
   users: [],
   policies: null,
+  audits: [],
 };
 
 const roleLabels: Record<Role, string> = {
@@ -177,6 +179,7 @@ export default function App() {
     next.bdcs = await safe(api.bdcs(token), []);
     next.sites = await safe(api.sites(token), []);
     next.policies = await safe(api.policies(token), null);
+    next.audits = await safe(api.audits(token), []);
     if (user.role === 'admin_NFN') {
       next.alerts = await safe(api.alerts(token), []);
       next.users = await safe(api.users(token), []);
@@ -455,9 +458,12 @@ function KpiStrip({ data, role, view }: { data: DashboardData; role: Role; view:
 
 function SlaOverview({ data }: { data: DashboardData }) {
   const thresholds = data.policies?.thresholds ?? {};
-  const openBdcs = data.openBdcs.slice(0, 4);
+  const bdcDeadlines = data.policies?.bdc_deadlines ?? [];
+  const criticalSla = (data.policies?.overdue_lots.length ?? 0) + bdcDeadlines.filter((item) => item.sla_state === 'critical').length;
+  const warningSla = bdcDeadlines.filter((item) => item.sla_state === 'warning').length;
+  const auditSummary = data.policies?.audit_summary ?? { entry_count: 0, output_count: 0, qr_scan_count: 0 };
   return (
-    <section className="sla-panel">
+    <section className={`sla-panel ${criticalSla ? 'critical' : warningSla ? 'warning' : ''}`}>
       <div className="sla-header">
         <div>
           <p className="eyebrow">SLA et timing</p>
@@ -466,7 +472,31 @@ function SlaOverview({ data }: { data: DashboardData }) {
         <div className="sla-thresholds">
           <span>Depot {thresholds.depot_max_storage_hours ?? 12}h</span>
           <span>{kg(thresholds.depot_max_storage_kg ?? 5000)} max</span>
+          <span>Transformation {thresholds.lot_transformation_sla_hours ?? 24}h</span>
+          <span>{criticalSla} critiques / {warningSla} proches</span>
         </div>
+      </div>
+      <div className="sla-highlight-grid">
+        <article className={`sla-highlight ${criticalSla ? 'critical' : 'ok'}`}>
+          <strong>{criticalSla}</strong>
+          <span>SLA critiques</span>
+        </article>
+        <article className={`sla-highlight ${warningSla ? 'warning' : 'ok'}`}>
+          <strong>{warningSla}</strong>
+          <span>SLA proches</span>
+        </article>
+        <article className="sla-highlight ok">
+          <strong>{auditSummary.entry_count}</strong>
+          <span>Audits entree</span>
+        </article>
+        <article className="sla-highlight ok">
+          <strong>{auditSummary.output_count}</strong>
+          <span>Audits sortie</span>
+        </article>
+        <article className="sla-highlight ok">
+          <strong>{auditSummary.qr_scan_count}</strong>
+          <span>Scans QR seuls</span>
+        </article>
       </div>
       <div className="sla-grid">
         <div className="sla-block">
@@ -497,16 +527,16 @@ function SlaOverview({ data }: { data: DashboardData }) {
         </div>
         <div className="sla-block">
           <strong>BDC ouverts</strong>
-          {openBdcs.map((bdc) => {
-            const hours = hoursUntil(bdc.expected_delivery_at);
+          {bdcDeadlines.slice(0, 4).map((bdc) => {
+            const hours = bdc.hours_remaining;
             return (
-              <article key={bdc.bdc_id} className={`deadline-row ${hours < 0 ? 'danger' : hours < 4 ? 'warning' : ''}`}>
+              <article key={bdc.bdc_id} className={`deadline-row ${bdc.sla_state === 'critical' ? 'danger' : bdc.sla_state === 'warning' ? 'warning' : ''}`}>
                 <span>{bdc.bdc_id}</span>
                 <small>{hours < 0 ? `${Math.abs(hours).toFixed(1)}h retard` : `${hours.toFixed(1)}h restantes`} - {bdc.destination_stage ?? bdc.kind}</small>
               </article>
             );
           })}
-          {openBdcs.length === 0 && <EmptyState text="Aucun BDC ouvert." />}
+          {bdcDeadlines.length === 0 && <EmptyState text="Aucun BDC ouvert." />}
         </div>
       </div>
     </section>
@@ -639,6 +669,7 @@ function DepotView({ token, data, busy, run }: { token: string; data: DashboardD
 
       <BdcPanel title="BDC ouverts" bdcs={data.openBdcs.filter((bdc) => bdc.kind === 'laundry')} />
       <QrPanel title="QR dernier lot depot" payload={currentQr} token={token} run={run} />
+      <AuditPanel title="Audits depot" audits={data.audits.filter((audit) => audit.module === 'depot')} />
     </section>
   );
 }
@@ -718,6 +749,7 @@ function LaundryView({ token, data, busy, run }: { token: string; data: Dashboar
       </Panel>
       <BdcPanel title="BDC laverie" bdcs={workBdcs} />
       <QrPanel title="QR BDC selectionne" payload={workBdc?.qr_payload ?? ''} token={token} run={run} />
+      <AuditPanel title="Audits laverie" audits={data.audits.filter((audit) => audit.module === 'laverie')} />
     </section>
   );
 }
@@ -793,6 +825,7 @@ function TransformerView({ token, data, busy, run, role }: { token: string; data
       )}
       <BdcPanel title="BDC transformateur" bdcs={workBdcs} />
       <QrPanel title="QR BDC selectionne" payload={workBdc?.qr_payload ?? ''} token={token} run={run} />
+      <AuditPanel title="Audits transformateur" audits={data.audits.filter((audit) => audit.module === 'transformateur')} />
     </section>
   );
 }
@@ -925,6 +958,7 @@ function AdminView({ token, data, run }: { token: string; data: DashboardData; r
         </div>
       </Panel>
       <BdcPanel title="Tous les BDC" bdcs={data.bdcs} />
+      <AuditPanel title="Tous les audits operateur" audits={data.audits} />
     </section>
   );
 }
@@ -956,8 +990,8 @@ function QrPanel({ title, payload, token, run }: { title: string; payload: strin
   async function validate(value: string) {
     const cleaned = value.trim();
     if (!cleaned) return;
-    await run('QR verifie', async () => {
-      const result = await api.scanQr(token, { qr_payload: cleaned });
+    await run('QR scanne et audite en BDD', async () => {
+      const result = await api.ingestQr(token, { qr_payload: cleaned });
       setScanResult(result);
       return result;
     });
@@ -1132,7 +1166,7 @@ function QrPanel({ title, payload, token, run }: { title: string; payload: strin
         <div className="qr-tools">
           <div className="inline-form">
             <input value={manualPayload} onChange={(event) => setManualPayload(event.target.value)} placeholder="Coller le payload QR scanne" />
-            <button className="primary-button" onClick={() => validate(manualPayload)} disabled={!manualPayload}>Verifier</button>
+            <button className="primary-button" onClick={() => validate(manualPayload)} disabled={!manualPayload}>Scanner + enregistrer</button>
           </div>
           <div className="qr-actions">
             <button className="secondary-button" onClick={scanCamera}>
@@ -1176,6 +1210,8 @@ function QrPanel({ title, payload, token, run }: { title: string; payload: strin
       <span>Acteur</span><strong>{scanResult.actor}</strong>
       <span>Lots</span><strong>{scanResult.lot_ids?.join(', ') || scanResult.lot_id || 'n/a'}</strong>
       <span>Produit le</span><strong>{when(scanResult.produced_at)}</strong>
+      <span>Audit BDD</span><strong>{scanResult.audit?.audit_id ?? 'non cree'}</strong>
+      <span>SLA audit</span><strong>{scanResult.audit?.sla_label ?? 'n/a'}</strong>
     </div>
 
     {scanResult.record && Object.keys(scanResult.record).length > 0 && (
@@ -1299,6 +1335,40 @@ function BdcPanel({ title, bdcs }: { title: string; bdcs: BdcRecord[] }) {
           </article>
         ))}
         {bdcs.length === 0 && <EmptyState text="Aucun BDC a afficher." />}
+      </div>
+    </Panel>
+  );
+}
+
+function AuditPanel({ title, audits }: { title: string; audits: OperatorAuditRecord[] }) {
+  const recent = audits.slice(0, 8);
+  const entries = audits.filter((audit) => audit.direction === 'entry').length;
+  const outputs = audits.filter((audit) => audit.direction === 'output').length;
+  const critical = audits.filter((audit) => audit.sla_state === 'critical').length;
+  return (
+    <Panel title={title} icon={ClipboardList} wide>
+      <div className="audit-summary">
+        <span>{entries} entrees</span>
+        <span>{outputs} sorties</span>
+        <span className={critical ? 'danger' : ''}>{critical} SLA critiques</span>
+      </div>
+      <div className="audit-grid">
+        {recent.map((audit) => (
+          <article key={audit.audit_id} className={`audit-card ${audit.sla_state}`}>
+            <div>
+              <strong>{audit.audit_id}</strong>
+              <span>{audit.action}</span>
+            </div>
+            <div className="audit-meta">
+              <span>{audit.direction}</span>
+              <span>{audit.ref_id}</span>
+              <span>{audit.weight_kg ? kg(audit.weight_kg) : 'poids n/a'}</span>
+              <span>{audit.sla_label ?? audit.sla_state}</span>
+            </div>
+            <small>{audit.actor} - {when(audit.created_at)}</small>
+          </article>
+        ))}
+        {recent.length === 0 && <EmptyState text="Aucun audit operateur encore enregistre." />}
       </div>
     </Panel>
   );

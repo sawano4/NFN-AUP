@@ -644,6 +644,31 @@ class QrScanRequest(BaseModel):
     expected_step: str | None = None
 
 
+class OperatorAuditRecord(BaseModel):
+    audit_id: str
+    actor: str
+    role: str | None = None
+    site_id: str | None = None
+    site_name: str | None = None
+    module: str
+    direction: Literal["entry", "output", "qr_scan", "internal"]
+    action: str
+    ref_type: str
+    ref_id: str
+    lot_ids: list[str] = Field(default_factory=list)
+    bdc_id: str | None = None
+    qr_step: str | None = None
+    qr_payload: str | None = None
+    integrity_hash: str | None = None
+    previous_hash: str | None = None
+    weight_kg: float | None = None
+    delta_pct: float | None = None
+    sla_state: Literal["ok", "warning", "critical"] = "ok"
+    sla_label: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
 class QrScanResult(BaseModel):
     valid: bool
     ref_id: str
@@ -658,6 +683,7 @@ class QrScanResult(BaseModel):
     store_verified: bool = False
     decoded_payload: dict[str, Any] = Field(default_factory=dict)
     record: dict[str, Any] = Field(default_factory=dict)
+    audit: OperatorAuditRecord | None = None
 
 
 class OperatorReportRow(BaseModel):
