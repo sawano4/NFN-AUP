@@ -1,5 +1,10 @@
 version: "3.9"
 
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql://nfn:nfn@postgres:5432/nfn
+  NFN_SECRET_KEY: ${NFN_SECRET_KEY:-change-me}
+  MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -41,6 +46,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.auth_service.app.main:app", "--host", "0.0.0.0", "--port", "8101"]
+    environment: *backend-env
     ports:
       - "8101:8101"
     depends_on:
@@ -52,6 +58,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.source_service.app.main:app", "--host", "0.0.0.0", "--port", "8102"]
+    environment: *backend-env
     ports:
       - "8102:8102"
     depends_on:
@@ -63,6 +70,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.mobile_service.app.main:app", "--host", "0.0.0.0", "--port", "8103"]
+    environment: *backend-env
     ports:
       - "8103:8103"
     depends_on:
@@ -74,8 +82,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.admin_service.app.main:app", "--host", "0.0.0.0", "--port", "8104"]
-    environment:
-      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+    environment: *backend-env
     ports:
       - "8104:8104"
     depends_on:
@@ -87,6 +94,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.operator_service.app.main:app", "--host", "0.0.0.0", "--port", "8105"]
+    environment: *backend-env
     ports:
       - "8105:8105"
     depends_on:
@@ -98,6 +106,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.alert_service.app.main:app", "--host", "0.0.0.0", "--port", "8106"]
+    environment: *backend-env
     ports:
       - "8106:8106"
     depends_on:
@@ -109,6 +118,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.document_service.app.main:app", "--host", "0.0.0.0", "--port", "8107"]
+    environment: *backend-env
     ports:
       - "8107:8107"
     depends_on:
@@ -119,6 +129,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.notification_service.app.main:app", "--host", "0.0.0.0", "--port", "8108"]
+    environment: *backend-env
     ports:
       - "8108:8108"
     depends_on:
@@ -127,4 +138,3 @@ services:
 volumes:
   postgres_data:
   minio_data:
-

@@ -1,0 +1,148 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap');
+
+@layer base {
+  :root {
+    /* Primary: Vibrant Green */
+    --primary: 134 60% 34%;
+    --primary-foreground: 0 0% 100%;
+    /* Accent: Orange */
+    --accent: 37 100% 45%;
+    --accent-foreground: 0 0% 100%;
+    /* Neutrals - Light mode */
+    --background: 0 0% 98%;
+    --foreground: 0 0% 15%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 15%;
+    --secondary: 134 40% 94%;
+    --secondary-foreground: 134 60% 26%;
+    --muted: 0 0% 95%;
+    --muted-foreground: 0 0% 45%;
+    --border: 0 0% 88%;
+    --input: 0 0% 88%;
+    --ring: 134 60% 34%;
+    --success: 134 60% 34%;
+    --warning: 37 100% 45%;
+    --error: 14 75% 60%;
+    --radius: 0.75rem;
+
+    /* CSS custom props for Tailwind color references */
+    --color-background: #F9FAFB;
+    --color-foreground: #1A1A1A;
+    --color-card: #FFFFFF;
+    --color-card-foreground: #1A1A1A;
+    --color-muted: #F3F4F6;
+    --color-muted-foreground: #6B7280;
+    --color-border: #E5E7EB;
+    --color-input: #E5E7EB;
+  }
+
+  .dark {
+    /* Primary: Vibrant Green (slightly lighter for dark bg) */
+    --primary: 134 55% 45%;
+    --primary-foreground: 0 0% 100%;
+    /* Accent: Orange */
+    --accent: 37 100% 50%;
+    --accent-foreground: 0 0% 100%;
+    /* Neutrals - Dark mode */
+    --background: 220 13% 9%;
+    --foreground: 0 0% 93%;
+    --card: 220 13% 13%;
+    --card-foreground: 0 0% 93%;
+    --secondary: 134 30% 18%;
+    --secondary-foreground: 134 50% 70%;
+    --muted: 220 13% 17%;
+    --muted-foreground: 0 0% 55%;
+    --border: 220 13% 22%;
+    --input: 220 13% 22%;
+    --ring: 134 55% 45%;
+
+    /* CSS custom props for Tailwind color references */
+    --color-background: #111318;
+    --color-foreground: #EDEDED;
+    --color-card: #1C1F26;
+    --color-card-foreground: #EDEDED;
+    --color-muted: #252830;
+    --color-muted-foreground: #8B8F9A;
+    --color-border: #2E3240;
+    --color-input: #2E3240;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-family: 'DM Sans', sans-serif;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'DM Sans', sans-serif;
+  }
+}
+
+@layer utilities {
+  .font-tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  .text-primary-custom {
+    color: #228B34;
+  }
+  .bg-primary-custom {
+    background-color: #228B34;
+  }
+  .border-primary-custom {
+    border-color: #228B34;
+  }
+  .text-accent-custom {
+    color: #E88E00;
+  }
+  .bg-accent-custom {
+    background-color: #E88E00;
+  }
+  .bg-secondary-custom {
+    background-color: #E8F5EB;
+  }
+  .bg-background-custom {
+    background-color: #F9FAFB;
+  }
+}
+
+.step-enter {
+  opacity: 0;
+  transform: translateX(24px);
+}
+.step-enter-active {
+  opacity: 1;
+  transform: translateX(0);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+.step-exit {
+  opacity: 1;
+  transform: translateX(0);
+}
+.step-exit-active {
+  opacity: 0;
+  transform: translateX(-24px);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fadeIn {
+  animation: fadeIn 0.25s ease forwards;
+}
+
+@keyframes pulse-success {
+  0%, 100% { background-color: rgba(34, 139, 52, 0.1); }
+  50% { background-color: rgba(34, 139, 52, 0.25); }
+}
+.animate-pulse-success {
+  animation: pulse-success 2s ease-in-out 3;
+}

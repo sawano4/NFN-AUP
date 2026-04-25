@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import base64
+import csv
+import hashlib
+import hmac
+import json
 import logging
+import os
+from io import StringIO
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -9,7 +15,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
-from .auth import decode_token, hash_password, issue_token_pair
+from .auth import SECRET_KEY, decode_token, hash_password, issue_token_pair
 from .contracts import (
     AlertCreate,
     AlertUpdate,
@@ -35,17 +41,28 @@ from .contracts import (
     LotChainLaverieDoneRecord,
     LotChainTransformateurDoneRecord,
     LotChainTransformateurRecord,
+    LaundryOutputCreate,
+    LaundryReceiptCreate,
     LotCreate,
     LotUpdate,
+    OperatorSiteCreate,
+    QrScanRequest,
+    ShipmentUpdate,
     SourceRegistrationCreate,
     SourceRegistrationUpdate,
+    StockTemperatureCreate,
+    T1ProductionCreate,
     ThresholdConfig,
     ThresholdUpdate,
+    TransformerReceiptCreate,
     TourStop,
     TransformateurCreate,
     TransformateurUpdate,
     UserCreate,
     UserUpdate,
+    WashRunCreate,
+    WashRunUpdate,
+    T2ReceptionCreate,
 )
 from .enums import AlertSeverity, AlertType, LotStatus, Role, SourceStatus, SyncJobType
 from .ids import (
@@ -60,9 +77,11 @@ from .ids import (
     format_media_id,
     format_message_id,
     format_source_id,
+    format_site_id,
     format_transformateur_id,
     format_user_id,
 )
+from .sql_gateway import SqlGateway
 from .state_store import PostgresStateStore
 
 
@@ -117,6 +136,7 @@ class PlatformState:
     _STATE_FIELDS = (
         "counters",
         "users",
+        "operator_sites",
         "refresh_tokens",
         "otps",
         "email_verified",
@@ -129,6 +149,15 @@ class PlatformState:
         "receipts",
         "classifications",
         "shipments",
+        "operator_audits",
+        "stock_temperature_logs",
+        "laundry_receipts",
+        "wash_runs",
+        "laundry_outputs",
+        "purity_certificates",
+        "transformer_receipts",
+        "t1_productions",
+        "t2_receptions",
         "documents",
         "alerts",
         "notifications",
@@ -148,6 +177,8 @@ class PlatformState:
         "create_user",
         "update_user",
         "delete_user",
+        "create_operator_site",
+        "update_operator_site",
         "create_notification",
         "send_email",
         "update_email",
@@ -178,8 +209,18 @@ class PlatformState:
         "update_classification",
         "delete_classification",
         "create_shipment",
+        "ingest_qr_payload",
+        "record_operator_audit",
         "update_shipment",
         "delete_shipment",
+        "record_stock_temperature",
+        "receive_laundry_shipment",
+        "create_wash_run",
+        "update_wash_run",
+        "record_laundry_output",
+        "receive_transformer_shipment",
+        "create_t1_production",
+        "create_t2_reception",
         "create_alert",
         "create_manual_alert",
         "refresh_overdue_alerts",
@@ -226,6 +267,7 @@ class PlatformState:
 
     def __post_init__(self) -> None:
         self._store = PostgresStateStore.from_env()
+        self._sql_gateway = SqlGateway.from_env() if os.getenv("NFN_USE_RELATIONAL_GATEWAY") == "1" else None
         self._suspend_persist = True
         self._persist_warning_emitted = False
         self.reset()
@@ -294,12 +336,82 @@ class PlatformState:
 
     def reset(self) -> None:
         self.counters = SequenceCounters()
+        now = utcnow()
+        self.operator_sites: dict[str, dict[str, Any]] = {
+            "site-depot-main": {
+                "site_id": "site-depot-main",
+                "name": "Depot Centre",
+                "site_type": "depot",
+                "wilaya": "Djelfa",
+                "commune": "Messaad",
+                "address": "Zone de tri principale",
+                "contact_email": "depot@nfn.example.com",
+                "active": True,
+                "created_at": now,
+            },
+            "site-depot-east": {
+                "site_id": "site-depot-east",
+                "name": "Depot Est",
+                "site_type": "depot",
+                "wilaya": "Laghouat",
+                "commune": "Aflou",
+                "address": "Cellules B",
+                "contact_email": "depot.est@nfn.example.com",
+                "active": True,
+                "created_at": now,
+            },
+            "site-laundry-main": {
+                "site_id": "site-laundry-main",
+                "name": "Laverie Centre",
+                "site_type": "laverie",
+                "wilaya": "Djelfa",
+                "commune": "Messaad",
+                "address": "Unite lavage 1",
+                "contact_email": "laundry@nfn.example.com",
+                "active": True,
+                "created_at": now,
+            },
+            "site-laundry-west": {
+                "site_id": "site-laundry-west",
+                "name": "Laverie Ouest",
+                "site_type": "laverie",
+                "wilaya": "Tiaret",
+                "commune": "Sougueur",
+                "address": "Unite lavage 2",
+                "contact_email": "laundry.ouest@nfn.example.com",
+                "active": True,
+                "created_at": now,
+            },
+            "site-t1-main": {
+                "site_id": "site-t1-main",
+                "name": "Transformateur T1 Centre",
+                "site_type": "transformer_t1",
+                "wilaya": "Alger",
+                "commune": "Rouiba",
+                "address": "Ligne isolants",
+                "contact_email": "t1@nfn.example.com",
+                "active": True,
+                "created_at": now,
+            },
+            "site-t2-main": {
+                "site_id": "site-t2-main",
+                "name": "Transformateur T2 Compost",
+                "site_type": "transformer_t2",
+                "wilaya": "Blida",
+                "commune": "Boufarik",
+                "address": "Ligne engrais",
+                "contact_email": "t2@nfn.example.com",
+                "active": True,
+                "created_at": now,
+            },
+        }
         self.users: dict[str, dict[str, Any]] = {
             "user-agent": {
                 "user_id": "user-agent",
                 "email": "agent@nfn.example.com",
                 "name": "Agent Demo",
                 "role": Role.AGENT,
+                "site_id": None,
                 "password_hash": hash_password("agent123"),
             },
             "user-depot": {
@@ -307,6 +419,7 @@ class PlatformState:
                 "email": "depot@nfn.example.com",
                 "name": "Depot Demo",
                 "role": Role.DEPOT,
+                "site_id": "site-depot-main",
                 "password_hash": hash_password("depot123"),
             },
             "user-admin": {
@@ -314,7 +427,32 @@ class PlatformState:
                 "email": "admin@nfn.example.com",
                 "name": "Admin NFN",
                 "role": Role.ADMIN,
+                "site_id": None,
                 "password_hash": hash_password("admin123"),
+            },
+            "user-laundry": {
+                "user_id": "user-laundry",
+                "email": "laundry@nfn.example.com",
+                "name": "Laundry Demo",
+                "role": Role.LAUNDRY,
+                "site_id": "site-laundry-main",
+                "password_hash": hash_password("laundry123"),
+            },
+            "user-t1": {
+                "user_id": "user-t1",
+                "email": "t1@nfn.example.com",
+                "name": "Transformer T1 Demo",
+                "role": Role.T1,
+                "site_id": "site-t1-main",
+                "password_hash": hash_password("t1123"),
+            },
+            "user-t2": {
+                "user_id": "user-t2",
+                "email": "t2@nfn.example.com",
+                "name": "Transformer T2 Demo",
+                "role": Role.T2,
+                "site_id": "site-t2-main",
+                "password_hash": hash_password("t2123"),
             },
         }
         self.refresh_tokens: dict[str, str] = {}
@@ -329,6 +467,15 @@ class PlatformState:
         self.receipts: dict[str, dict[str, Any]] = {}
         self.classifications: dict[str, dict[str, Any]] = {}
         self.shipments: dict[str, dict[str, Any]] = {}
+        self.operator_audits: dict[str, dict[str, Any]] = {}
+        self.stock_temperature_logs: dict[str, dict[str, Any]] = {}
+        self.laundry_receipts: dict[str, dict[str, Any]] = {}
+        self.wash_runs: dict[str, dict[str, Any]] = {}
+        self.laundry_outputs: dict[str, dict[str, Any]] = {}
+        self.purity_certificates: dict[str, dict[str, Any]] = {}
+        self.transformer_receipts: dict[str, dict[str, Any]] = {}
+        self.t1_productions: dict[str, dict[str, Any]] = {}
+        self.t2_receptions: dict[str, dict[str, Any]] = {}
         self.documents: dict[str, dict[str, Any]] = {}
         self.alerts: dict[str, dict[str, Any]] = {}
         self.notifications: dict[str, dict[str, Any]] = {}
@@ -345,6 +492,14 @@ class PlatformState:
             "laverie_overdue_hours": 24,
             "depot_overdue_hours": 48,
             "alert_check_interval_minutes": 5,
+            "stock_temperature_c": 45.0,
+            "laundry_yield_tonte_pct": 53.0,
+            "laundry_yield_abattage_pct": 33.0,
+            "transformer_confirmation_hours": 48,
+            "depot_max_storage_kg": 5000.0,
+            "depot_max_storage_hours": 12,
+            "laundry_max_processing_hours": 12,
+            "lot_transformation_sla_hours": 24,
         }
         # Non-persisted runtime flag — updated by the background alert-check thread
         self._last_alert_check_at: datetime | None = None
@@ -352,6 +507,8 @@ class PlatformState:
         self._seed_tours()
         self._seed_infrastructure()
         self._seed_mock_lots()
+        if self._sql_gateway is not None:
+            self._sql_gateway.reset()
 
     def _seed_sources(self) -> None:
         now = utcnow()
@@ -436,6 +593,133 @@ class PlatformState:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{resource_name} not found")
         return record
 
+    def _site_name(self, site_id: str | None) -> str | None:
+        if site_id is None:
+            return None
+        site_record = self.operator_sites.get(site_id)
+        return site_record["name"] if site_record else None
+
+    def _get_user_by_email(self, email: str) -> dict[str, Any]:
+        user = next((item for item in self.users.values() if item["email"] == email), None)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        return user
+
+    def _actor_site_id(self, actor_email: str) -> str | None:
+        return self._get_user_by_email(actor_email).get("site_id")
+
+    def _infer_site_id_for_email(self, email: str, fallback_type: str | None = None) -> str | None:
+        user = next((item for item in self.users.values() if item["email"] == email), None)
+        if user and user.get("site_id"):
+            return user["site_id"]
+        site = next((item for item in self.operator_sites.values() if item.get("contact_email") == email), None)
+        if site:
+            return site["site_id"]
+        if fallback_type:
+            fallback = next((item for item in self.operator_sites.values() if item["site_type"] == fallback_type and item["active"]), None)
+            return fallback["site_id"] if fallback else None
+        return None
+
+    def _canonical_json(self, payload: dict[str, Any]) -> str:
+        def normalize(value: Any) -> Any:
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(value, Role | LotStatus | AlertSeverity | AlertType | SourceStatus | SyncJobType):
+                return value.value
+            if isinstance(value, dict):
+                return {key: normalize(value[key]) for key in sorted(value)}
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            return value
+
+        return json.dumps(normalize(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def _hmac_hex(self, payload: dict[str, Any]) -> str:
+        return hmac.new(SECRET_KEY.encode("utf-8"), self._canonical_json(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _encode_qr(self, payload: dict[str, Any]) -> str:
+        signed = {**payload}
+        signed["sig"] = self._hmac_hex(payload)
+        return base64.urlsafe_b64encode(self._canonical_json(signed).encode("utf-8")).decode("utf-8").rstrip("=")
+
+    def _encode_compact_qr(self, payload: dict[str, Any]) -> str:
+        body = self._canonical_json(payload)
+        body64 = base64.urlsafe_b64encode(body.encode("utf-8")).decode("utf-8").rstrip("=")
+        signature = hmac.new(SECRET_KEY.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).digest()
+        sig64 = base64.urlsafe_b64encode(signature[:16]).decode("utf-8").rstrip("=")
+        return f"NFN2.{body64}.{sig64}"
+
+    def _decode_qr(self, qr_payload: str) -> dict[str, Any]:
+        qr_payload = qr_payload.strip()
+        if qr_payload.startswith("NFN2."):
+            try:
+                _, body64, sig64 = qr_payload.split(".", 2)
+                padding = "=" * (-len(body64) % 4)
+                body = base64.urlsafe_b64decode(body64 + padding).decode("utf-8")
+                expected = base64.urlsafe_b64encode(
+                    hmac.new(SECRET_KEY.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).digest()[:16]
+                ).decode("utf-8").rstrip("=")
+                if not hmac.compare_digest(sig64, expected):
+                    raise ValueError("signature mismatch")
+                compact = json.loads(body)
+                produced_at = datetime.fromtimestamp(float(compact["t"]), timezone.utc).isoformat()
+                return {
+                    "v": compact.get("v", 2),
+                    "step": compact["s"],
+                    "ref_id": compact["r"],
+                    "actor": compact["a"],
+                    "produced_at": produced_at,
+                    "previous_hash": compact.get("p"),
+                    "integrity_hash": compact["h"],
+                    "lot_id": compact.get("l"),
+                    "lot_ids": compact.get("ls") or ([] if compact.get("l") is None else [compact["l"]]),
+                }
+            except Exception as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid QR payload") from exc
+        try:
+            padding = "=" * (-len(qr_payload) % 4)
+            decoded = json.loads(base64.urlsafe_b64decode(qr_payload + padding).decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid QR payload") from exc
+        signature = decoded.pop("sig", None)
+        if not signature or not hmac.compare_digest(signature, self._hmac_hex(decoded)):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="QR signature mismatch")
+        return decoded
+
+    def _build_qr_payload(
+        self,
+        *,
+        step: str,
+        ref_id: str,
+        actor: str,
+        produced_at: datetime,
+        previous_hash: str | None,
+        integrity_hash: str,
+        lot_id: str | None = None,
+        lot_ids: list[str] | None = None,
+    ) -> str:
+        return self._encode_compact_qr(
+            {
+                "v": 2,
+                "s": step,
+                "r": ref_id,
+                "a": actor,
+                "t": int(produced_at.timestamp()),
+                "p": previous_hash[:12] if previous_hash else None,
+                "h": integrity_hash[:32],
+                "l": lot_id,
+                "ls": lot_ids or ([] if lot_id is None else [lot_id]),
+            }
+        )
+
+    def _validate_qr_payload(self, qr_payload: str, expected_ref_id: str | None = None, expected_step: str | None = None) -> dict[str, Any]:
+        decoded = self._decode_qr(qr_payload)
+        if expected_ref_id is not None and decoded.get("ref_id") != expected_ref_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="QR does not match the selected record")
+        if expected_step is not None and decoded.get("step") != expected_step:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="QR step is not valid for this action")
+        return decoded
+
     def _remove_alerts_for_lot(self, lot_id: str) -> None:
         for alert_id in [key for key, value in self.alerts.items() if value.get("lot_id") == lot_id]:
             del self.alerts[alert_id]
@@ -444,6 +728,7 @@ class PlatformState:
         shipment = self._get_required(self.shipments, bdc_id, "Shipment")
         lines = [
             f"NFN Bon de commande {bdc_id}",
+            f"Type: {shipment.get('kind', 'laundry')}",
             f"Lots: {', '.join(shipment['lot_ids']) if shipment['lot_ids'] else 'None'}",
             f"Poids total: {shipment['total_weight_kg']:.1f} kg",
             f"Humidite: {shipment['humidity_pct']:.1f}%",
@@ -486,8 +771,73 @@ class PlatformState:
         self.documents[document_id] = document
         return document
 
+    def _shipment_weight(self, shipment: dict[str, Any]) -> float:
+        if shipment["kind"] == "transformer":
+            output = self.laundry_outputs.get(shipment.get("source_bdc_id", ""))
+            if output is not None:
+                return float(output["dry_weight_kg"])
+        return float(shipment["total_weight_kg"])
+
+    def _lot_type(self, lot_id: str) -> str:
+        lot = self._get_required(self.lots, lot_id, "Lot")
+        wool_type = lot.get("details", {}).get("wool_type")
+        if wool_type:
+            return str(wool_type)
+        source = self.sources.get(lot["source_id"])
+        if source and source.get("source_type") == "abattoir":
+            return "abattage"
+        return "tonte"
+
+    def _derive_next_actions(self, lot_id: str) -> list[str]:
+        lot = self._get_required(self.lots, lot_id, "Lot")
+        status = lot["status"]
+        actions: list[str] = []
+        if status == LotStatus.AWAITING_DEPOT_RECEIPT:
+            actions.append("receive_at_depot")
+        if status == LotStatus.AT_DEPOT:
+            actions.extend(["classify", "record_stock_temperature"])
+        if status == LotStatus.CLASSIFIED:
+            actions.extend(["record_stock_temperature", "ship_to_laundry"])
+        if status == LotStatus.IN_TRANSIT_LAUNDRY:
+            actions.append("receive_at_laundry")
+        if status == LotStatus.AT_LAUNDRY:
+            actions.append("start_wash_run")
+        if status == LotStatus.WASHED:
+            actions.append("ship_to_transformer")
+        if status == LotStatus.IN_TRANSIT_TRANSFORMER:
+            actions.append("confirm_transformer_receipt")
+        if status == LotStatus.DELIVERED:
+            actions.append("trace_final_product")
+        return actions
+
+    def _build_stock_lot_view(self, lot_id: str) -> dict[str, Any]:
+        lot = self._get_required(self.lots, lot_id, "Lot")
+        receipt = self.receipts.get(lot_id, {})
+        classification = self.classifications.get(lot_id, {})
+        return {
+            "lot_id": lot_id,
+            "source_id": lot["source_id"],
+            "source_name": lot["source_name"],
+            "status": lot["status"],
+            "observed_weight_kg": float(lot["observed_weight_kg"]),
+            "estimated_weight_kg": float(lot["estimated_weight_kg"]),
+            "current_site_id": lot.get("current_site_id"),
+            "current_site_name": self._site_name(lot.get("current_site_id")),
+            "details": deepcopy(lot.get("details", {})),
+            "qr_payload": lot.get("qr_payload"),
+            "storage_zone": receipt.get("storage_zone"),
+            "arrival_condition": receipt.get("arrival_condition"),
+            "classification": classification.get("classification"),
+            "vm_percent": classification.get("vm_percent"),
+            "fiber_state": classification.get("fiber_state"),
+            "color": classification.get("color"),
+            "next_allowed_actions": self._derive_next_actions(lot_id),
+        }
+
     # Auth / Users
     def authenticate(self, email: str, password: str) -> dict[str, str]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.authenticate(email, password)
         user = next((item for item in self.users.values() if item["email"] == email), None)
         if user is None or user["password_hash"] != hash_password(password):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -496,6 +846,8 @@ class PlatformState:
         return tokens
 
     def refresh(self, refresh_token: str) -> dict[str, str]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.refresh(refresh_token)
         payload = decode_token(refresh_token, expected_type="refresh")
         if refresh_token not in self.refresh_tokens:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown refresh token")
@@ -505,12 +857,16 @@ class PlatformState:
         return tokens
 
     def get_user_profile(self, user_id: str) -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.get_user_profile(user_id)
         user = self._get_required(self.users, user_id, "User")
         return {
             "user_id": user["user_id"],
             "email": user["email"],
             "name": user["name"],
             "role": user["role"],
+            "site_id": user.get("site_id"),
+            "site_name": self._site_name(user.get("site_id")),
         }
 
     def list_users(self) -> list[dict[str, Any]]:
@@ -519,6 +875,8 @@ class PlatformState:
     def create_user(self, payload: UserCreate) -> dict[str, Any]:
         if any(user["email"] == str(payload.email) for user in self.users.values()):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User email already exists")
+        if payload.site_id is not None:
+            self._get_required(self.operator_sites, payload.site_id, "Operator site")
         user_id = format_user_id(self.counters.user)
         self.counters.user += 1
         self.users[user_id] = {
@@ -526,6 +884,7 @@ class PlatformState:
             "email": str(payload.email),
             "name": payload.name,
             "role": payload.role,
+            "site_id": payload.site_id,
             "password_hash": hash_password(payload.password),
         }
         return self.get_user_profile(user_id)
@@ -542,6 +901,10 @@ class PlatformState:
             user["name"] = updates["name"]
         if "role" in updates:
             user["role"] = updates["role"]
+        if "site_id" in updates:
+            if updates["site_id"] is not None:
+                self._get_required(self.operator_sites, updates["site_id"], "Operator site")
+            user["site_id"] = updates["site_id"]
         if "password" in updates and updates["password"] is not None:
             user["password_hash"] = hash_password(updates["password"])
         return self.get_user_profile(user_id)
@@ -552,8 +915,44 @@ class PlatformState:
         self.refresh_tokens = {token: current_user_id for token, current_user_id in self.refresh_tokens.items() if current_user_id != user_id}
         return {"message": f"User {user_id} deleted"}
 
+    # Operator sites
+    def list_operator_sites(self, site_type: str | None = None) -> list[dict[str, Any]]:
+        records = self.operator_sites.values()
+        if site_type is not None:
+            records = [site for site in records if site["site_type"] == site_type]
+        return sorted((deepcopy(site) for site in records), key=lambda site: site["name"])
+
+    def create_operator_site(self, payload: OperatorSiteCreate) -> dict[str, Any]:
+        site_id = format_site_id(self.counters.site)
+        self.counters.site += 1
+        site = {
+            "site_id": site_id,
+            "name": payload.name,
+            "site_type": payload.site_type,
+            "wilaya": payload.wilaya,
+            "commune": payload.commune,
+            "address": payload.address,
+            "contact_email": str(payload.contact_email) if payload.contact_email is not None else None,
+            "active": payload.active,
+            "created_at": utcnow(),
+        }
+        self.operator_sites[site_id] = site
+        self.publish_event("operator.site_created", actor="admin", details={"site_id": site_id, "site_type": payload.site_type, "name": payload.name})
+        return deepcopy(site)
+
+    def update_operator_site(self, site_id: str, payload: OperatorSiteCreate) -> dict[str, Any]:
+        site = self._get_required(self.operator_sites, site_id, "Operator site")
+        updates = payload.model_dump(exclude_unset=True)
+        if "contact_email" in updates and updates["contact_email"] is not None:
+            updates["contact_email"] = str(updates["contact_email"])
+        site.update(updates)
+        self.publish_event("operator.site_updated", actor="admin", details={"site_id": site_id, "changes": updates})
+        return deepcopy(site)
+
     # Notifications
     def create_notification(self, payload: EmailMessageCreate) -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.create_notification(str(payload.recipient), payload.subject, payload.body)
         message = {
             "message_id": format_message_id(self.counters.message),
             "recipient": str(payload.recipient),
@@ -569,6 +968,8 @@ class PlatformState:
         return self.create_notification(EmailMessageCreate(recipient=recipient, subject=subject, body=body))
 
     def list_emails(self) -> list[dict[str, Any]]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.list_emails()
         return self._sorted_records(self.notifications)
 
     def get_email(self, message_id: str) -> dict[str, Any]:
@@ -592,12 +993,16 @@ class PlatformState:
 
     # Source service
     def request_otp(self, email: str) -> dict[str, str]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.request_otp(email)
         otp_code = f"{(self.counters.message * 731) % 1000000:06d}"
         self.otps[email] = {"otp_code": otp_code, "expires_at": utcnow() + timedelta(minutes=10)}
         self.send_email(email, "NFN verification code", f"Your NFN email OTP is {otp_code}.")
         return {"message": "OTP sent by email"}
 
     def verify_otp(self, email: str, otp_code: str) -> dict[str, str]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.verify_otp(email, otp_code)
         record = self.otps.get(email)
         if record is None or record["expires_at"] < utcnow() or record["otp_code"] != otp_code:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
@@ -605,6 +1010,8 @@ class PlatformState:
         return {"message": "Email verified"}
 
     def create_source_registration(self, payload: SourceRegistrationCreate, require_verified: bool = True, actor: str = "source-service") -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.create_source_registration(payload, require_verified=require_verified)
         email = str(payload.email)
         if require_verified and email not in self.email_verified:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email must be verified before submission")
@@ -632,12 +1039,18 @@ class PlatformState:
         return deepcopy(registration)
 
     def list_sources(self) -> list[dict[str, Any]]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.list_sources()
         return self._sorted_records(self.sources)
 
     def get_source(self, public_id: str) -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.get_source(public_id)
         return deepcopy(self._get_required(self.sources, public_id, "Source"))
 
     def get_source_status(self, public_id: str) -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.get_source_status(public_id)
         source = self._get_required(self.sources, public_id, "Source")
         return {"public_id": public_id, "status": source["status"], "reason": source["reason"]}
 
@@ -658,9 +1071,13 @@ class PlatformState:
         return {"message": f"Source {public_id} deleted"}
 
     def list_pending_sources(self) -> list[dict[str, Any]]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.list_pending_sources()
         return [deepcopy(source) for source in self.sources.values() if source["status"] == SourceStatus.PENDING]
 
     def approve_source(self, public_id: str, actor_email: str, comment: str | None = None) -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.approve_source(public_id, actor_email, comment)
         source = self._get_required(self.sources, public_id, "Source")
         source["status"] = SourceStatus.ACTIVE
         source["reason"] = comment
@@ -669,6 +1086,8 @@ class PlatformState:
         return deepcopy(source)
 
     def reject_source(self, public_id: str, actor_email: str, reason: str) -> dict[str, Any]:
+        if self._sql_gateway is not None:
+            return self._sql_gateway.reject_source(public_id, actor_email, reason)
         source = self._get_required(self.sources, public_id, "Source")
         source["status"] = SourceStatus.REJECTED
         source["reason"] = reason
@@ -706,6 +1125,32 @@ class PlatformState:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Lot already exists")
         source = self.sources.get(payload.source_id)
         source_name = payload.source_name or (source["name"] if source else "Unknown source")
+        actor_site_id = self._actor_site_id(actor_email) if any(user["email"] == actor_email for user in self.users.values()) else None
+        wool_origin = payload.wool_origin or ("abattage" if source and source.get("source_type") == "abattoir" else "tonte")
+        details = {
+            "cleanliness": payload.cleanliness,
+            "gps": payload.gps,
+            "wool_type": payload.wool_type or wool_origin,
+            "wool_origin": wool_origin,
+            "producer_identifier": payload.producer_identifier,
+            "shearing_date": payload.shearing_date,
+            "collection_date": payload.collection_date,
+            "sheep_race": payload.sheep_race,
+            "cleanliness_score": payload.cleanliness_score,
+            "cleanliness_notes": payload.cleanliness_notes,
+            "sanitary_treatment_date": payload.sanitary_treatment_date,
+            "packaging_count": payload.packaging_count,
+            "packaging_type": payload.packaging_type,
+            "staple_length_mm": payload.staple_length_mm,
+            "color": payload.color,
+            "jarre_pct": payload.jarre_pct,
+            "extraction_method": payload.extraction_method,
+            "humidity_pct": payload.humidity_pct,
+            "leather_residue_pct": payload.leather_residue_pct,
+            "quality_score": payload.quality_score,
+            "specialist_notes": payload.specialist_notes,
+        }
+        details = {key: value for key, value in details.items() if value not in (None, [], {})}
         created = {
             "lot_id": lot_id,
             "source_id": payload.source_id,
@@ -713,11 +1158,10 @@ class PlatformState:
             "observed_weight_kg": float(payload.observed_weight_kg),
             "estimated_weight_kg": float(payload.estimated_weight_kg),
             "status": payload.status,
+            "current_site_id": actor_site_id if payload.status in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED} else None,
+            "qr_payload": None,
             "created_at": utcnow(),
-            "details": {
-                "cleanliness": payload.cleanliness,
-                "gps": payload.gps,
-            },
+            "details": details,
         }
         self.lots[lot_id] = created
         self.publish_event(
@@ -731,8 +1175,12 @@ class PlatformState:
                 "estimated_weight_kg": float(payload.estimated_weight_kg),
                 "cleanliness": payload.cleanliness,
                 "gps": payload.gps,
+                "details": details,
             },
         )
+        last_event = self.lot_events.get(lot_id, [])[-1] if self.lot_events.get(lot_id) else None
+        if last_event is not None:
+            created["qr_payload"] = last_event.get("qr_payload")
         return deepcopy(created)
 
     def update_lot(self, lot_id: str, payload: LotUpdate, actor_email: str) -> dict[str, Any]:
@@ -941,8 +1389,16 @@ class PlatformState:
         storage_zone: str,
         arrival_condition: str,
         discrepancy_reason: str | None,
+        qr_payload: str | None = None,
     ) -> dict[str, Any]:
         lot = self._get_required(self.lots, lot_id, "Lot")
+        if qr_payload:
+            self._validate_qr_payload(qr_payload, expected_ref_id=lot_id)
+        if discrepancy_reason is not None and discrepancy_reason == "":
+            discrepancy_reason = None
+        actor_site_id = self._actor_site_id(actor_email)
+        if lot.get("current_site_id") not in {None, actor_site_id}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Lot is assigned to another depot")
         expected = float(lot["observed_weight_kg"])
         delta_pct = abs(float(received_weight_kg) - expected) / max(expected, 1) * 100
         if delta_pct > self.thresholds["receipt_gap_pct"] and not discrepancy_reason:
@@ -961,6 +1417,7 @@ class PlatformState:
         }
         self.receipts[lot_id] = receipt
         lot["status"] = LotStatus.AT_DEPOT
+        lot["current_site_id"] = actor_site_id
         self.publish_event(
             "depot.lot_received",
             actor=actor_email,
@@ -973,12 +1430,28 @@ class PlatformState:
                 "discrepancy_reason": discrepancy_reason,
             },
         )
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module="depot",
+            direction="entry",
+            action="depot.receipt",
+            ref_type="lot",
+            ref_id=lot_id,
+            lot_ids=[lot_id],
+            qr_payload=qr_payload,
+            weight_kg=float(received_weight_kg),
+            delta_pct=delta_pct,
+            metadata={"storage_zone": storage_zone, "arrival_condition": arrival_condition, "discrepancy_reason": discrepancy_reason},
+        )
         return deepcopy(receipt)
 
     def update_receipt(self, lot_id: str, payload: DepotReceiptUpdate, actor_email: str) -> dict[str, Any]:
         receipt = self._get_required(self.receipts, lot_id, "Receipt")
         updates = payload.model_dump(exclude_unset=True)
         lot = self._get_required(self.lots, lot_id, "Lot")
+        changed_fields = {key: value for key, value in updates.items() if key != "correction_reason"}
+        if changed_fields and not updates.get("correction_reason"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Correction reason is required when updating a receipt")
         if "received_weight_kg" in updates:
             receipt["received_weight_kg"] = float(updates["received_weight_kg"])
         for key in ("storage_zone", "arrival_condition", "discrepancy_reason"):
@@ -1005,7 +1478,10 @@ class PlatformState:
         return deepcopy(self._get_required(self.classifications, lot_id, "Classification"))
 
     def classify_lot(self, actor_email: str, lot_id: str, classification: str, vm_percent: float, fiber_state: str, color: str) -> dict[str, Any]:
-        self._get_required(self.lots, lot_id, "Lot")
+        lot = self._get_required(self.lots, lot_id, "Lot")
+        actor_site_id = self._actor_site_id(actor_email)
+        if lot.get("current_site_id") != actor_site_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Lot is assigned to another depot")
         record = {
             "lot_id": lot_id,
             "classification": classification,
@@ -1016,12 +1492,16 @@ class PlatformState:
         }
         self.classifications[lot_id] = record
         self.lots[lot_id]["status"] = LotStatus.CLASSIFIED
+        self.lots[lot_id]["current_site_id"] = actor_site_id
         self.publish_event("depot.lot_classified", actor=actor_email, lot_id=lot_id, details={"classification": classification, "vm_percent": vm_percent, "fiber_state": fiber_state, "color": color})
         return deepcopy(record)
 
     def update_classification(self, lot_id: str, payload: DepotClassificationUpdate, actor_email: str) -> dict[str, Any]:
         classification = self._get_required(self.classifications, lot_id, "Classification")
         updates = payload.model_dump(exclude_unset=True)
+        changed_fields = {key: value for key, value in updates.items() if key != "correction_reason"}
+        if changed_fields and not updates.get("correction_reason"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Correction reason is required when updating a classification")
         for key in ("classification", "vm_percent", "fiber_state", "color"):
             if key in updates:
                 classification[key] = updates[key]
@@ -1035,16 +1515,54 @@ class PlatformState:
             self.lots[lot_id]["status"] = LotStatus.AT_DEPOT
         return {"message": f"Classification for {lot_id} deleted"}
 
-    def list_shipments(self) -> list[dict[str, Any]]:
-        return self._sorted_records(self.shipments)
+    def list_shipments(self, site_id: str | None = None) -> list[dict[str, Any]]:
+        if site_id is None:
+            return self._sorted_records(self.shipments)
+        records = {
+            bdc_id: shipment
+            for bdc_id, shipment in self.shipments.items()
+            if shipment.get("source_site_id") == site_id or shipment.get("destination_site_id") == site_id
+        }
+        return self._sorted_records(records)
 
     def get_bdc(self, bdc_id: str) -> dict[str, Any]:
         return deepcopy(self._get_required(self.shipments, bdc_id, "BDC"))
 
-    def create_shipment(self, actor_email: str, lot_ids: list[str], humidity_pct: float, laundry_name: str, transporteur_email: str, destination_email: str, expected_delivery_at: datetime) -> dict[str, Any]:
+    def create_shipment(
+        self,
+        actor_email: str,
+        lot_ids: list[str],
+        humidity_pct: float,
+        laundry_name: str,
+        transporteur_email: str,
+        destination_email: str,
+        expected_delivery_at: datetime,
+        kind: str = "laundry",
+        source_stage: str = "depot",
+        destination_stage: str = "laundry",
+        source_bdc_id: str | None = None,
+        certificate_id: str | None = None,
+        destination_site_id: str | None = None,
+        qr_payload: str | None = None,
+    ) -> dict[str, Any]:
         missing = [lot_id for lot_id in lot_ids if lot_id not in self.classifications]
-        if missing:
+        if kind == "laundry" and missing:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Lots must be classified before shipment: {', '.join(missing)}")
+        actor_site_id = self._actor_site_id(actor_email)
+        if kind == "laundry":
+            for lot_id in lot_ids:
+                lot = self._get_required(self.lots, lot_id, "Lot")
+                if lot.get("current_site_id") != actor_site_id:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Lot {lot_id} is assigned to another depot")
+        if qr_payload and lot_ids:
+            self._validate_qr_payload(qr_payload, expected_ref_id=lot_ids[0])
+        if destination_site_id is not None:
+            self._get_required(self.operator_sites, destination_site_id, "Operator site")
+        elif kind == "laundry":
+            destination_site_id = self._infer_site_id_for_email(destination_email, "laverie")
+        elif kind == "transformer":
+            fallback_type = "transformer_t1" if destination_stage.lower() == "t1" else "transformer_t2"
+            destination_site_id = self._infer_site_id_for_email(destination_email, fallback_type)
         bdc_id = format_bdc_id(self.counters.shipment)
         self.counters.shipment += 1
         total_weight = sum(float(self.lots[lot_id]["observed_weight_kg"]) for lot_id in lot_ids)
@@ -1058,21 +1576,69 @@ class PlatformState:
             "destination_email": destination_email,
             "expected_delivery_at": expected_delivery_at,
             "pdf_url": f"/documents/{bdc_id}.pdf",
+            "kind": kind,
+            "status": "issued",
+            "source_stage": source_stage,
+            "destination_stage": destination_stage,
+            "source_site_id": actor_site_id,
+            "destination_site_id": destination_site_id,
+            "source_bdc_id": source_bdc_id,
+            "certificate_id": certificate_id,
+            "previous_hash": None,
+            "integrity_hash": None,
+            "qr_payload": None,
+            "closed_at": None,
             "created_at": utcnow(),
         }
+        previous_hashes = [
+            self.lot_events[lot_id][-1]["integrity_hash"]
+            for lot_id in lot_ids
+            if self.lot_events.get(lot_id) and self.lot_events[lot_id][-1].get("integrity_hash")
+        ]
+        previous_hash = hashlib.sha256("|".join(previous_hashes).encode("utf-8")).hexdigest() if previous_hashes else None
+        integrity_basis = {key: value for key, value in shipment.items() if key not in {"integrity_hash", "qr_payload"}}
+        shipment["previous_hash"] = previous_hash
+        shipment["integrity_hash"] = self._hmac_hex({"record": integrity_basis, "previous_hash": previous_hash})
+        shipment["qr_payload"] = self._build_qr_payload(
+            step=f"{kind}.bdc_issued",
+            ref_id=bdc_id,
+            actor=actor_email,
+            produced_at=shipment["created_at"],
+            previous_hash=previous_hash,
+            integrity_hash=shipment["integrity_hash"],
+            lot_ids=lot_ids,
+        )
         self.shipments[bdc_id] = shipment
         for lot_id in lot_ids:
-            self.lots[lot_id]["status"] = LotStatus.IN_TRANSIT_LAUNDRY
+            self.lots[lot_id]["status"] = LotStatus.IN_TRANSIT_LAUNDRY if kind == "laundry" else LotStatus.IN_TRANSIT_TRANSFORMER
+            self.lots[lot_id]["current_site_id"] = destination_site_id
         self._rebuild_shipment_document(bdc_id)
         self.send_email(transporteur_email, f"NFN BDC {bdc_id}", f"Your BDC {bdc_id} is ready.")
         self.send_email(destination_email, f"NFN incoming shipment {bdc_id}", f"Shipment {bdc_id} is expected.")
         self.publish_event("bdc.issued", actor=actor_email, details={"bdc_id": bdc_id, "lot_ids": lot_ids, "expected_delivery_at": expected_delivery_at.isoformat()})
+        audit_module = "laverie" if source_stage == "laundry" else source_stage
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module=audit_module,
+            direction="output",
+            action=f"{kind}.bdc_issued",
+            ref_type="bdc",
+            ref_id=bdc_id,
+            lot_ids=lot_ids,
+            bdc_id=bdc_id,
+            qr_step=f"{kind}.bdc_issued",
+            qr_payload=shipment["qr_payload"],
+            integrity_hash=shipment["integrity_hash"],
+            previous_hash=shipment["previous_hash"],
+            weight_kg=total_weight,
+            metadata={"destination_stage": destination_stage, "destination_site_id": destination_site_id, "pdf_url": shipment["pdf_url"], "certificate_id": certificate_id},
+        )
         return deepcopy(shipment)
 
-    def update_shipment(self, bdc_id: str, payload: dict[str, Any], actor_email: str) -> dict[str, Any]:
+    def update_shipment(self, bdc_id: str, payload: ShipmentUpdate | dict[str, Any], actor_email: str) -> dict[str, Any]:
         shipment = self._get_required(self.shipments, bdc_id, "Shipment")
-        updates = deepcopy(payload)
-        if "lot_ids" in updates:
+        updates = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else deepcopy(payload)
+        if "lot_ids" in updates and shipment["kind"] == "laundry":
             missing = [lot_id for lot_id in updates["lot_ids"] if lot_id not in self.classifications]
             if missing:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Lots must be classified before shipment: {', '.join(missing)}")
@@ -1089,10 +1655,460 @@ class PlatformState:
         shipment = self._get_required(self.shipments, bdc_id, "Shipment")
         for lot_id in shipment["lot_ids"]:
             if lot_id in self.lots:
-                self.lots[lot_id]["status"] = LotStatus.CLASSIFIED
+                self.lots[lot_id]["status"] = LotStatus.CLASSIFIED if shipment["kind"] == "laundry" else LotStatus.WASHED
         del self.shipments[bdc_id]
         self.documents.pop(bdc_id, None)
         return {"message": f"Shipment {bdc_id} deleted"}
+
+    def list_pending_receipts(self, site_id: str | None = None) -> list[dict[str, Any]]:
+        pending_ids = [
+            lot_id
+            for lot_id, lot in self.lots.items()
+            if lot["status"] == LotStatus.AWAITING_DEPOT_RECEIPT and (site_id is None or lot.get("current_site_id") in {None, site_id})
+        ]
+        return [self._build_stock_lot_view(lot_id) for lot_id in pending_ids]
+
+    def list_stock_lots(self, site_id: str | None = None) -> list[dict[str, Any]]:
+        stock_ids = [
+            lot_id
+            for lot_id, lot in self.lots.items()
+            if lot["status"] in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED} and (site_id is None or lot.get("current_site_id") == site_id)
+        ]
+        return [self._build_stock_lot_view(lot_id) for lot_id in stock_ids]
+
+    def get_lot_detail(self, lot_id: str) -> dict[str, Any]:
+        lot = deepcopy(self._get_required(self.lots, lot_id, "Lot"))
+        lot["receipt"] = deepcopy(self.receipts.get(lot_id))
+        lot["classification"] = deepcopy(self.classifications.get(lot_id))
+        lot["next_allowed_actions"] = self._derive_next_actions(lot_id)
+        lot["last_event"] = deepcopy(self.lot_events.get(lot_id, [])[-1]) if self.lot_events.get(lot_id) else None
+        return lot
+
+    def list_open_bdcs(self, kind: str | None = None, site_id: str | None = None) -> list[dict[str, Any]]:
+        records = [
+            shipment for shipment in self.shipments.values()
+            if shipment.get("status") != "closed" and (kind is None or shipment.get("kind") == kind)
+            and (site_id is None or shipment.get("source_site_id") == site_id or shipment.get("destination_site_id") == site_id)
+        ]
+        return self._sorted_records({shipment["bdc_id"]: shipment for shipment in records})
+
+    def _audit_sla(self, *, ref_id: str, ref_type: str, created_at: datetime | None = None, expected_at: datetime | None = None) -> tuple[str, str]:
+        now = utcnow()
+        if expected_at is not None:
+            remaining = (expected_at - now).total_seconds() / 3600
+            if remaining < 0:
+                return "critical", f"Retard {abs(remaining):.1f}h"
+            if remaining < 4:
+                return "warning", f"Echeance {remaining:.1f}h"
+            return "ok", f"Echeance {remaining:.1f}h"
+        if created_at is not None and ref_type == "lot":
+            age_hours = (now - created_at).total_seconds() / 3600
+            max_hours = float(self.thresholds["lot_transformation_sla_hours"])
+            if age_hours > max_hours:
+                return "critical", f"SLA lot depasse {age_hours:.1f}h/{max_hours:.0f}h"
+            if age_hours > max_hours * 0.8:
+                return "warning", f"SLA lot proche {age_hours:.1f}h/{max_hours:.0f}h"
+            return "ok", f"SLA lot {age_hours:.1f}h/{max_hours:.0f}h"
+        return "ok", f"{ref_type} {ref_id}"
+
+    def record_operator_audit(
+        self,
+        *,
+        actor_email: str,
+        module: str,
+        direction: str,
+        action: str,
+        ref_type: str,
+        ref_id: str,
+        lot_ids: list[str] | None = None,
+        bdc_id: str | None = None,
+        qr_step: str | None = None,
+        qr_payload: str | None = None,
+        integrity_hash: str | None = None,
+        previous_hash: str | None = None,
+        weight_kg: float | None = None,
+        delta_pct: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user = next((item for item in self.users.values() if item["email"] == actor_email), {})
+        site_id = user.get("site_id")
+        shipment = self.shipments.get(bdc_id or ref_id)
+        lot = self.lots.get(ref_id) if ref_type == "lot" else None
+        expected_at = shipment.get("expected_delivery_at") if shipment else None
+        created_at = lot.get("created_at") if lot else None
+        sla_state, sla_label = self._audit_sla(ref_id=ref_id, ref_type=ref_type, created_at=created_at, expected_at=expected_at)
+        audit_id = f"AUD-{len(self.operator_audits) + 1:05d}"
+        audit = {
+            "audit_id": audit_id,
+            "actor": actor_email,
+            "role": user.get("role").value if hasattr(user.get("role"), "value") else user.get("role"),
+            "site_id": site_id,
+            "site_name": self._site_name(site_id),
+            "module": module,
+            "direction": direction,
+            "action": action,
+            "ref_type": ref_type,
+            "ref_id": ref_id,
+            "lot_ids": lot_ids or [],
+            "bdc_id": bdc_id,
+            "qr_step": qr_step,
+            "qr_payload": qr_payload,
+            "integrity_hash": integrity_hash,
+            "previous_hash": previous_hash,
+            "weight_kg": weight_kg,
+            "delta_pct": delta_pct,
+            "sla_state": sla_state,
+            "sla_label": sla_label,
+            "metadata": metadata or {},
+            "created_at": utcnow(),
+        }
+        self.operator_audits[audit_id] = audit
+        return deepcopy(audit)
+
+    def list_operator_audits(self, site_id: str | None = None, module: str | None = None, direction: str | None = None) -> list[dict[str, Any]]:
+        records = self.operator_audits.values()
+        if site_id is not None:
+            records = [record for record in records if record.get("site_id") == site_id]
+        if module:
+            records = [record for record in records if record.get("module") == module]
+        if direction:
+            records = [record for record in records if record.get("direction") == direction]
+        return sorted((deepcopy(record) for record in records), key=lambda item: item["created_at"], reverse=True)
+
+    def list_stock_temperature_logs(self, lot_id: str | None = None) -> list[dict[str, Any]]:
+        records = self.stock_temperature_logs.values()
+        if lot_id is not None:
+            records = [record for record in records if record["lot_id"] == lot_id]
+        return sorted((deepcopy(record) for record in records), key=lambda item: item["created_at"], reverse=True)
+
+    def record_stock_temperature(self, actor_email: str, payload: StockTemperatureCreate) -> dict[str, Any]:
+        lot = self._get_required(self.lots, payload.lot_id, "Lot")
+        if lot["status"] not in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Lot is not in depot stock")
+        entry_id = f"TMP-{len(self.stock_temperature_logs) + 1:04d}"
+        record = {
+            "entry_id": entry_id,
+            "lot_id": payload.lot_id,
+            "temperature_c": float(payload.temperature_c),
+            "note": payload.note,
+            "created_at": utcnow(),
+        }
+        self.stock_temperature_logs[entry_id] = record
+        self.publish_event("depot.stock_temperature_recorded", actor=actor_email, lot_id=payload.lot_id, details={"temperature_c": float(payload.temperature_c), "note": payload.note})
+        return deepcopy(record)
+
+    def receive_laundry_shipment(self, actor_email: str, payload: LaundryReceiptCreate) -> dict[str, Any]:
+        shipment = self._get_required(self.shipments, payload.bdc_id, "BDC")
+        if payload.qr_payload:
+            self._validate_qr_payload(payload.qr_payload, expected_ref_id=payload.bdc_id, expected_step="laundry.bdc_issued")
+        if shipment["kind"] != "laundry":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="BDC is not a laundry shipment")
+        actor_site_id = self._actor_site_id(actor_email)
+        if shipment.get("destination_site_id") not in {None, actor_site_id}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="BDC is assigned to another laverie")
+        if shipment["status"] == "closed":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="BDC already closed")
+        expected = self._shipment_weight(shipment)
+        delta_pct = abs(float(payload.received_weight_kg) - expected) / max(expected, 1) * 100
+        if delta_pct > self.thresholds["receipt_gap_pct"] and not payload.discrepancy_reason:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Discrepancy reason is required when weight gap exceeds threshold")
+        record = {
+            "bdc_id": payload.bdc_id,
+            "received_weight_kg": float(payload.received_weight_kg),
+            "expected_weight_kg": expected,
+            "delta_pct": delta_pct,
+            "discrepancy_reason": payload.discrepancy_reason,
+            "created_at": utcnow(),
+        }
+        self.laundry_receipts[payload.bdc_id] = record
+        shipment["status"] = "closed"
+        shipment["closed_at"] = utcnow()
+        for lot_id in shipment["lot_ids"]:
+            self.lots[lot_id]["status"] = LotStatus.AT_LAUNDRY
+            self.lots[lot_id]["current_site_id"] = actor_site_id
+            self.publish_event("laundry.lot_received", actor=actor_email, lot_id=lot_id, details={"bdc_id": payload.bdc_id, "received_weight_kg": float(payload.received_weight_kg), "expected_weight_kg": expected, "delta_pct": delta_pct, "discrepancy_reason": payload.discrepancy_reason})
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module="laverie",
+            direction="entry",
+            action="laundry.receipt",
+            ref_type="bdc",
+            ref_id=payload.bdc_id,
+            lot_ids=shipment["lot_ids"],
+            bdc_id=payload.bdc_id,
+            qr_step="laundry.bdc_issued" if payload.qr_payload else None,
+            qr_payload=payload.qr_payload,
+            integrity_hash=shipment.get("integrity_hash"),
+            previous_hash=shipment.get("previous_hash"),
+            weight_kg=float(payload.received_weight_kg),
+            delta_pct=delta_pct,
+            metadata={"expected_weight_kg": expected, "discrepancy_reason": payload.discrepancy_reason},
+        )
+        return deepcopy(record)
+
+    def create_wash_run(self, actor_email: str, payload: WashRunCreate) -> dict[str, Any]:
+        shipment = self._get_required(self.shipments, payload.bdc_id, "BDC")
+        if payload.qr_payload:
+            self._validate_qr_payload(payload.qr_payload, expected_ref_id=payload.bdc_id)
+        if shipment["kind"] != "laundry":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="BDC is not a laundry shipment")
+        if shipment.get("destination_site_id") not in {None, self._actor_site_id(actor_email)}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="BDC is assigned to another laverie")
+        if payload.bdc_id not in self.laundry_receipts:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Laundry reception is required before washing")
+        record = {
+            "bdc_id": payload.bdc_id,
+            "water_temperature_c": float(payload.water_temperature_c),
+            "detergent": payload.detergent,
+            "duration_minutes": int(payload.duration_minutes),
+            "target_transformer": payload.target_transformer,
+            "override_reason": payload.override_reason,
+            "created_at": utcnow(),
+            "updated_at": None,
+        }
+        self.wash_runs[payload.bdc_id] = record
+        for lot_id in shipment["lot_ids"]:
+            self.publish_event("laundry.wash_run_started", actor=actor_email, lot_id=lot_id, details={"bdc_id": payload.bdc_id, "water_temperature_c": float(payload.water_temperature_c), "detergent": payload.detergent, "duration_minutes": int(payload.duration_minutes), "target_transformer": payload.target_transformer, "override_reason": payload.override_reason})
+        return deepcopy(record)
+
+    def update_wash_run(self, bdc_id: str, payload: WashRunUpdate, actor_email: str) -> dict[str, Any]:
+        run = self._get_required(self.wash_runs, bdc_id, "Wash run")
+        updates = payload.model_dump(exclude_unset=True)
+        if updates and not updates.get("correction_reason"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Correction reason is required when updating a wash run")
+        for key in ("water_temperature_c", "detergent", "duration_minutes", "target_transformer", "correction_reason"):
+            if key in updates:
+                run[key] = updates[key]
+        run["updated_at"] = utcnow()
+        shipment = self._get_required(self.shipments, bdc_id, "BDC")
+        for lot_id in shipment["lot_ids"]:
+            self.publish_event("laundry.wash_run_updated", actor=actor_email, lot_id=lot_id, details=updates | {"bdc_id": bdc_id})
+        return deepcopy(run)
+
+    def get_purity_certificate(self, certificate_id: str) -> dict[str, Any]:
+        return deepcopy(self._get_required(self.purity_certificates, certificate_id, "Purity certificate"))
+
+    def record_laundry_output(self, actor_email: str, payload: LaundryOutputCreate) -> dict[str, Any]:
+        shipment = self._get_required(self.shipments, payload.bdc_id, "BDC")
+        if payload.qr_payload:
+            self._validate_qr_payload(payload.qr_payload, expected_ref_id=payload.bdc_id)
+        if shipment.get("destination_site_id") not in {None, self._actor_site_id(actor_email)}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="BDC is assigned to another laverie")
+        if payload.bdc_id not in self.wash_runs:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wash run is required before laundry output")
+        input_weight = self.laundry_receipts[payload.bdc_id]["received_weight_kg"]
+        total_out = float(payload.dry_weight_kg) + float(payload.waste_weight_kg) + float(payload.water_loss_kg)
+        mass_gap_pct = abs(input_weight - total_out) / max(input_weight, 1) * 100
+        yield_pct = float(payload.dry_weight_kg) / max(input_weight, 1) * 100
+        lot_type = self._lot_type(shipment["lot_ids"][0]) if shipment["lot_ids"] else "tonte"
+        min_yield = self.thresholds["laundry_yield_abattage_pct"] if lot_type == "abattage" else self.thresholds["laundry_yield_tonte_pct"]
+        run = self.wash_runs[payload.bdc_id]
+        transformer_target = run["target_transformer"]
+        certificate_id = f"CERT-{payload.bdc_id}"
+        cert_lines = [
+            f"NFN Certificat de purete {certificate_id}",
+            f"BDC source: {payload.bdc_id}",
+            f"Poids net sec: {float(payload.dry_weight_kg):.1f} kg",
+            f"Taux humidite residuelle: {float(payload.residual_humidity_pct):.1f}%",
+            f"Taux suint residuel: {float(payload.residual_suint_pct):.1f}%",
+            f"pH: {float(payload.ph):.2f}",
+            f"Grade: {payload.grade}",
+        ]
+        self._create_document_record(certificate_id, f"NFN Certificat de purete {certificate_id}", "purity_certificate", cert_lines)
+        certificate = {
+            "certificate_id": certificate_id,
+            "bdc_id": payload.bdc_id,
+            "grade": payload.grade,
+            "dry_weight_kg": float(payload.dry_weight_kg),
+            "residual_humidity_pct": float(payload.residual_humidity_pct),
+            "residual_suint_pct": float(payload.residual_suint_pct),
+            "ph": float(payload.ph),
+            "pdf_url": f"/documents/{certificate_id}.pdf",
+            "created_at": utcnow(),
+        }
+        self.purity_certificates[certificate_id] = certificate
+        transformer_shipment = self.create_shipment(
+            actor_email=actor_email,
+            lot_ids=shipment["lot_ids"],
+            humidity_pct=float(payload.residual_humidity_pct),
+            laundry_name=f"Transformer {transformer_target}",
+            transporteur_email=str(payload.transporteur_email),
+            destination_email=str(payload.destination_email),
+            expected_delivery_at=payload.expected_delivery_at,
+            kind="transformer",
+            source_stage="laundry",
+            destination_stage=transformer_target.lower(),
+            source_bdc_id=payload.bdc_id,
+            certificate_id=certificate_id,
+            destination_site_id=payload.transformer_site_id,
+        )
+        record = {
+            "bdc_id": payload.bdc_id,
+            "dry_weight_kg": float(payload.dry_weight_kg),
+            "waste_weight_kg": float(payload.waste_weight_kg),
+            "water_loss_kg": float(payload.water_loss_kg),
+            "residual_humidity_pct": float(payload.residual_humidity_pct),
+            "residual_suint_pct": float(payload.residual_suint_pct),
+            "ph": float(payload.ph),
+            "grade": payload.grade,
+            "yield_pct": yield_pct,
+            "mass_balance_gap_pct": mass_gap_pct,
+            "transformer_target": transformer_target,
+            "certificate_id": certificate_id,
+            "transformer_bdc_id": transformer_shipment["bdc_id"],
+            "notes": payload.notes,
+            "created_at": utcnow(),
+        }
+        self.laundry_outputs[payload.bdc_id] = record
+        for lot_id in shipment["lot_ids"]:
+            self.publish_event("laundry.output_recorded", actor=actor_email, lot_id=lot_id, details={"bdc_id": payload.bdc_id, "yield_pct": yield_pct, "mass_balance_gap_pct": mass_gap_pct, "grade": payload.grade, "transformer_target": transformer_target, "certificate_id": certificate_id})
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module="laverie",
+            direction="output",
+            action="laundry.output",
+            ref_type="bdc",
+            ref_id=payload.bdc_id,
+            lot_ids=shipment["lot_ids"],
+            bdc_id=payload.bdc_id,
+            qr_payload=payload.qr_payload,
+            weight_kg=float(payload.dry_weight_kg),
+            delta_pct=mass_gap_pct,
+            metadata={"yield_pct": yield_pct, "mass_balance_gap_pct": mass_gap_pct, "certificate_id": certificate_id, "transformer_bdc_id": transformer_shipment["bdc_id"]},
+        )
+        return deepcopy(record)
+
+    def receive_transformer_shipment(self, actor_email: str, payload: TransformerReceiptCreate) -> dict[str, Any]:
+        shipment = self._get_required(self.shipments, payload.bdc_id, "BDC")
+        if payload.qr_payload:
+            self._validate_qr_payload(payload.qr_payload, expected_ref_id=payload.bdc_id, expected_step="transformer.bdc_issued")
+        if shipment["kind"] != "transformer":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="BDC is not a transformer shipment")
+        actor_site_id = self._actor_site_id(actor_email)
+        if shipment.get("destination_site_id") not in {None, actor_site_id}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="BDC is assigned to another transformer")
+        expected = self._shipment_weight(shipment)
+        delta_pct = abs(float(payload.received_weight_kg) - expected) / max(expected, 1) * 100
+        if delta_pct > self.thresholds["receipt_gap_pct"] and not payload.discrepancy_reason:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Discrepancy reason is required when weight gap exceeds threshold")
+        record = {
+            "bdc_id": payload.bdc_id,
+            "received_weight_kg": float(payload.received_weight_kg),
+            "expected_weight_kg": expected,
+            "delta_pct": delta_pct,
+            "price_da_per_kg": float(payload.price_da_per_kg),
+            "discrepancy_reason": payload.discrepancy_reason,
+            "created_at": utcnow(),
+        }
+        self.transformer_receipts[payload.bdc_id] = record
+        shipment["status"] = "closed"
+        shipment["closed_at"] = utcnow()
+        for lot_id in shipment["lot_ids"]:
+            self.lots[lot_id]["current_site_id"] = actor_site_id
+            self.publish_event("transformer.shipment_received", actor=actor_email, lot_id=lot_id, details={"bdc_id": payload.bdc_id, "received_weight_kg": float(payload.received_weight_kg), "expected_weight_kg": expected, "delta_pct": delta_pct, "price_da_per_kg": float(payload.price_da_per_kg), "discrepancy_reason": payload.discrepancy_reason})
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module="transformateur",
+            direction="entry",
+            action="transformer.receipt",
+            ref_type="bdc",
+            ref_id=payload.bdc_id,
+            lot_ids=shipment["lot_ids"],
+            bdc_id=payload.bdc_id,
+            qr_step="transformer.bdc_issued" if payload.qr_payload else None,
+            qr_payload=payload.qr_payload,
+            integrity_hash=shipment.get("integrity_hash"),
+            previous_hash=shipment.get("previous_hash"),
+            weight_kg=float(payload.received_weight_kg),
+            delta_pct=delta_pct,
+            metadata={"expected_weight_kg": expected, "price_da_per_kg": float(payload.price_da_per_kg), "discrepancy_reason": payload.discrepancy_reason},
+        )
+        return deepcopy(record)
+
+    def create_t1_production(self, actor_email: str, payload: T1ProductionCreate) -> dict[str, Any]:
+        shipment = self._get_required(self.shipments, payload.bdc_id, "BDC")
+        if payload.qr_payload:
+            self._validate_qr_payload(payload.qr_payload, expected_ref_id=payload.bdc_id)
+        if shipment["destination_stage"] != "t1":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="BDC is not assigned to T1")
+        if shipment.get("destination_site_id") not in {None, self._actor_site_id(actor_email)}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="BDC is assigned to another transformer")
+        if payload.bdc_id not in self.transformer_receipts:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transformer receipt is required first")
+        production_id = f"T1-{len(self.t1_productions) + 1:04d}"
+        final_lot_id = f"FINAL-T1-{len(self.t1_productions) + 1:04d}"
+        record = {
+            "production_id": production_id,
+            "bdc_id": payload.bdc_id,
+            "flow_destination": payload.flow_destination,
+            "anti_mite": payload.anti_mite,
+            "binding_fiber_pct": float(payload.binding_fiber_pct),
+            "fire_retardant": payload.fire_retardant,
+            "target_density_kg_m3": float(payload.target_density_kg_m3),
+            "target_thickness_mm": float(payload.target_thickness_mm),
+            "final_lot_id": final_lot_id,
+            "created_at": utcnow(),
+        }
+        self.t1_productions[production_id] = record
+        for lot_id in shipment["lot_ids"]:
+            self.lots[lot_id]["status"] = LotStatus.DELIVERED
+            self.publish_event("transformer.t1_production_recorded", actor=actor_email, lot_id=lot_id, details={"bdc_id": payload.bdc_id, "final_lot_id": final_lot_id, "flow_destination": payload.flow_destination})
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module="transformateur",
+            direction="output",
+            action="transformer.t1_output",
+            ref_type="bdc",
+            ref_id=payload.bdc_id,
+            lot_ids=shipment["lot_ids"],
+            bdc_id=payload.bdc_id,
+            qr_payload=payload.qr_payload,
+            integrity_hash=shipment.get("integrity_hash"),
+            weight_kg=self._shipment_weight(shipment),
+            metadata={"production_id": production_id, "final_lot_id": final_lot_id, "flow_destination": payload.flow_destination},
+        )
+        return deepcopy(record)
+
+    def create_t2_reception(self, actor_email: str, payload: T2ReceptionCreate) -> dict[str, Any]:
+        shipment = self._get_required(self.shipments, payload.bdc_id, "BDC")
+        if payload.qr_payload:
+            self._validate_qr_payload(payload.qr_payload, expected_ref_id=payload.bdc_id)
+        if shipment["destination_stage"] != "t2":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="BDC is not assigned to T2")
+        if shipment.get("destination_site_id") not in {None, self._actor_site_id(actor_email)}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="BDC is assigned to another transformer")
+        if payload.bdc_id not in self.transformer_receipts:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transformer receipt is required first")
+        reception_id = f"T2-{len(self.t2_receptions) + 1:04d}"
+        final_lot_id = f"FINAL-T2-{len(self.t2_receptions) + 1:04d}"
+        record = {
+            "reception_id": reception_id,
+            "bdc_id": payload.bdc_id,
+            "dryness_ok": payload.dryness_ok,
+            "foreign_bodies_ok": payload.foreign_bodies_ok,
+            "unloading_mode": payload.unloading_mode,
+            "final_lot_id": final_lot_id,
+            "created_at": utcnow(),
+        }
+        self.t2_receptions[reception_id] = record
+        for lot_id in shipment["lot_ids"]:
+            self.lots[lot_id]["status"] = LotStatus.DELIVERED
+            self.publish_event("transformer.t2_reception_recorded", actor=actor_email, lot_id=lot_id, details={"bdc_id": payload.bdc_id, "final_lot_id": final_lot_id, "dryness_ok": payload.dryness_ok, "foreign_bodies_ok": payload.foreign_bodies_ok, "unloading_mode": payload.unloading_mode})
+        self.record_operator_audit(
+            actor_email=actor_email,
+            module="transformateur",
+            direction="output",
+            action="transformer.t2_output",
+            ref_type="bdc",
+            ref_id=payload.bdc_id,
+            lot_ids=shipment["lot_ids"],
+            bdc_id=payload.bdc_id,
+            qr_payload=payload.qr_payload,
+            integrity_hash=shipment.get("integrity_hash"),
+            weight_kg=self._shipment_weight(shipment),
+            metadata={"reception_id": reception_id, "final_lot_id": final_lot_id, "dryness_ok": payload.dryness_ok, "foreign_bodies_ok": payload.foreign_bodies_ok, "unloading_mode": payload.unloading_mode},
+        )
+        return deepcopy(record)
 
     # Alerts / admin
     def create_alert(self, alert_type: AlertType, severity: AlertSeverity, lot_id: str | None, message: str, actors: list[str], metadata: dict[str, Any]) -> dict[str, Any]:
@@ -1245,12 +2261,145 @@ class PlatformState:
         except Exception:
             logger.exception("refresh_overdue_alerts: receipt gap check failed")
 
+    def refresh_policy_alerts(self) -> None:
+        now = utcnow()
+        existing = {
+            (alert["alert_type"], alert.get("lot_id"), alert["metadata"].get("site_id"))
+            for alert in self.alerts.values()
+            if alert["resolved_at"] is None
+        }
+
+        depot_weights: dict[str, float] = {}
+        for lot in self.lots.values():
+            site_id = lot.get("current_site_id")
+            if site_id and lot["status"] in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED}:
+                depot_weights[site_id] = depot_weights.get(site_id, 0.0) + float(lot["observed_weight_kg"])
+
+        for site_id, total_weight in depot_weights.items():
+            if total_weight > float(self.thresholds["depot_max_storage_kg"]):
+                key = (AlertType.DEPOT_CAPACITY_EXCEEDED, None, site_id)
+                if key not in existing:
+                    self.create_alert(
+                        AlertType.DEPOT_CAPACITY_EXCEEDED,
+                        AlertSeverity.CRITICAL,
+                        None,
+                        f"Depot {self._site_name(site_id) or site_id} storage is {total_weight:.1f} kg, above policy max {self.thresholds['depot_max_storage_kg']:.1f} kg.",
+                        ["admin@nfn.example.com"],
+                        {"site_id": site_id, "current_weight_kg": round(total_weight, 2), "max_storage_kg": self.thresholds["depot_max_storage_kg"]},
+                    )
+
+        for lot_id, lot in self.lots.items():
+            created_at = lot["created_at"]
+            age_hours = (now - created_at).total_seconds() / 3600
+            site_id = lot.get("current_site_id")
+            if lot["status"] in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED} and age_hours > float(self.thresholds["depot_max_storage_hours"]):
+                key = (AlertType.DEPOT_STORAGE_TIME_EXCEEDED, lot_id, site_id)
+                if key not in existing:
+                    self.create_alert(
+                        AlertType.DEPOT_STORAGE_TIME_EXCEEDED,
+                        AlertSeverity.WARNING,
+                        lot_id,
+                        f"Lot {lot_id} stayed in depot for {age_hours:.1f}h, above policy max {self.thresholds['depot_max_storage_hours']}h.",
+                        ["admin@nfn.example.com"],
+                        {"site_id": site_id, "age_hours": round(age_hours, 2), "max_hours": self.thresholds["depot_max_storage_hours"]},
+                    )
+            if lot["status"] in {LotStatus.AT_LAUNDRY, LotStatus.WASHED} and age_hours > float(self.thresholds["laundry_max_processing_hours"]):
+                key = (AlertType.LAUNDRY_PROCESSING_TIME_EXCEEDED, lot_id, site_id)
+                if key not in existing:
+                    self.create_alert(
+                        AlertType.LAUNDRY_PROCESSING_TIME_EXCEEDED,
+                        AlertSeverity.WARNING,
+                        lot_id,
+                        f"Lot {lot_id} stayed in laundry processing for {age_hours:.1f}h, above policy max {self.thresholds['laundry_max_processing_hours']}h.",
+                        ["admin@nfn.example.com"],
+                        {"site_id": site_id, "age_hours": round(age_hours, 2), "max_hours": self.thresholds["laundry_max_processing_hours"]},
+                    )
+            if lot["status"] != LotStatus.DELIVERED and age_hours > float(self.thresholds["lot_transformation_sla_hours"]):
+                key = (AlertType.LOT_TRANSFORMATION_SLA_EXCEEDED, lot_id, site_id)
+                if key not in existing:
+                    self.create_alert(
+                        AlertType.LOT_TRANSFORMATION_SLA_EXCEEDED,
+                        AlertSeverity.CRITICAL,
+                        lot_id,
+                        f"Lot {lot_id} is not delivered after {age_hours:.1f}h, above end-to-end SLA {self.thresholds['lot_transformation_sla_hours']}h.",
+                        ["admin@nfn.example.com"],
+                        {"site_id": site_id, "age_hours": round(age_hours, 2), "max_hours": self.thresholds["lot_transformation_sla_hours"], "status": lot["status"]},
+                    )
+
+    def policy_status(self, site_id: str | None = None) -> dict[str, Any]:
+        self.refresh_policy_alerts()
+        depot_weights: dict[str, float] = {}
+        now = utcnow()
+        overdue_lots: list[dict[str, Any]] = []
+        for lot_id, lot in self.lots.items():
+            current_site_id = lot.get("current_site_id")
+            if site_id is not None and current_site_id != site_id:
+                continue
+            if current_site_id and lot["status"] in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED}:
+                depot_weights[current_site_id] = depot_weights.get(current_site_id, 0.0) + float(lot["observed_weight_kg"])
+            if lot["status"] != LotStatus.DELIVERED:
+                age_hours = (now - lot["created_at"]).total_seconds() / 3600
+                if age_hours > float(self.thresholds["lot_transformation_sla_hours"]):
+                    overdue_lots.append(
+                        {
+                            "lot_id": lot_id,
+                            "status": lot["status"],
+                            "site_id": current_site_id,
+                            "age_hours": round(age_hours, 2),
+                            "max_hours": self.thresholds["lot_transformation_sla_hours"],
+                        }
+                    )
+        depot_capacity = [
+            {
+                "site_id": current_site_id,
+                "site_name": self._site_name(current_site_id),
+                "current_weight_kg": round(weight, 2),
+                "max_storage_kg": self.thresholds["depot_max_storage_kg"],
+                "utilization_pct": round(weight / max(float(self.thresholds["depot_max_storage_kg"]), 1) * 100, 2),
+                "breached": weight > float(self.thresholds["depot_max_storage_kg"]),
+            }
+            for current_site_id, weight in sorted(depot_weights.items())
+        ]
+        bdc_deadlines = []
+        for shipment in self.shipments.values():
+            if shipment.get("status") == "closed":
+                continue
+            if site_id is not None and shipment.get("source_site_id") != site_id and shipment.get("destination_site_id") != site_id:
+                continue
+            hours_remaining = (shipment["expected_delivery_at"] - now).total_seconds() / 3600
+            if hours_remaining < 0:
+                state = "critical"
+            elif hours_remaining < 4:
+                state = "warning"
+            else:
+                state = "ok"
+            bdc_deadlines.append(
+                {
+                    "bdc_id": shipment["bdc_id"],
+                    "kind": shipment["kind"],
+                    "destination_stage": shipment.get("destination_stage"),
+                    "lot_ids": shipment["lot_ids"],
+                    "hours_remaining": round(hours_remaining, 2),
+                    "sla_state": state,
+                    "expected_delivery_at": shipment["expected_delivery_at"],
+                }
+            )
+        bdc_deadlines.sort(key=lambda item: item["hours_remaining"])
+        audit_summary = {
+            "entry_count": len([audit for audit in self.operator_audits.values() if audit["direction"] == "entry" and (site_id is None or audit.get("site_id") == site_id)]),
+            "output_count": len([audit for audit in self.operator_audits.values() if audit["direction"] == "output" and (site_id is None or audit.get("site_id") == site_id)]),
+            "qr_scan_count": len([audit for audit in self.operator_audits.values() if audit["direction"] == "qr_scan" and (site_id is None or audit.get("site_id") == site_id)]),
+        }
+        return {"thresholds": deepcopy(self.thresholds), "depot_capacity": depot_capacity, "overdue_lots": overdue_lots, "bdc_deadlines": bdc_deadlines, "audit_summary": audit_summary}
+
     def list_alerts(self) -> list[dict[str, Any]]:
         self.refresh_overdue_alerts()
+        self.refresh_policy_alerts()
         return self._sorted_records(self.alerts)
 
     def get_alert(self, alert_id: str) -> dict[str, Any]:
         self.refresh_overdue_alerts()
+        self.refresh_policy_alerts()
         return deepcopy(self._get_required(self.alerts, alert_id, "Alert"))
 
     def update_alert(self, alert_id: str, payload: AlertUpdate) -> dict[str, Any]:
@@ -1282,6 +2431,22 @@ class PlatformState:
             delta_pct = abs(received - expected) / max(expected, 1) * 100
             if delta_pct > self.thresholds["receipt_gap_pct"]:
                 self.create_alert(AlertType.RECEIPT_GAP, AlertSeverity.CRITICAL, event["lot_id"], f"Depot receipt gap is {delta_pct:.1f}% for {event['lot_id']}.", [event["actor"], "admin@nfn.example.com"], {"delta_pct": round(delta_pct, 2), **details})
+        elif event_type == "depot.stock_temperature_recorded":
+            temperature_c = float(details["temperature_c"])
+            if temperature_c > self.thresholds["stock_temperature_c"]:
+                self.create_alert(AlertType.STOCK_TEMPERATURE, AlertSeverity.CRITICAL, event["lot_id"], f"Stock temperature is {temperature_c:.1f}C for {event['lot_id']}.", [event["actor"], "admin@nfn.example.com"], details)
+        elif event_type == "laundry.lot_received":
+            delta_pct = float(details["delta_pct"])
+            if delta_pct > self.thresholds["receipt_gap_pct"]:
+                self.create_alert(AlertType.LAUNDRY_RECEIPT_GAP, AlertSeverity.CRITICAL, event["lot_id"], f"Laundry receipt gap is {delta_pct:.1f}% for {event['lot_id']}.", [event["actor"], "admin@nfn.example.com"], details)
+        elif event_type == "laundry.output_recorded":
+            yield_pct = float(details["yield_pct"])
+            min_yield = self.thresholds["laundry_yield_abattage_pct"] if self._lot_type(event["lot_id"]) == "abattage" else self.thresholds["laundry_yield_tonte_pct"]
+            if yield_pct < min_yield:
+                self.create_alert(AlertType.LAUNDRY_YIELD_LOW, AlertSeverity.WARNING, event["lot_id"], f"Laundry yield is {yield_pct:.1f}% for {event['lot_id']}.", [event["actor"], "admin@nfn.example.com"], details)
+            mass_gap_pct = float(details["mass_balance_gap_pct"])
+            if mass_gap_pct > 2.0:
+                self.create_alert(AlertType.MASS_BALANCE_GAP, AlertSeverity.CRITICAL, event["lot_id"], f"Mass balance gap is {mass_gap_pct:.1f}% for {event['lot_id']}.", [event["actor"], "admin@nfn.example.com"], details)
 
     def resolve_alert(self, alert_id: str, comment: str) -> dict[str, Any]:
         alert = self._get_required(self.alerts, alert_id, "Alert")
@@ -1296,10 +2461,14 @@ class PlatformState:
 
     def dashboard_summary(self) -> dict[str, Any]:
         self.refresh_overdue_alerts()
+        self.refresh_policy_alerts()
         pipeline = {
             "collecte": 0.0,
             "depot": 0.0,
             "transit_laverie": 0.0,
+            "laverie": 0.0,
+            "transit_transformateur": 0.0,
+            "livre": 0.0,
         }
         for lot in self.lots.values():
             weight = float(lot["observed_weight_kg"])
@@ -1309,8 +2478,14 @@ class PlatformState:
                 pipeline["depot"] += weight
             elif lot["status"] == LotStatus.IN_TRANSIT_LAUNDRY:
                 pipeline["transit_laverie"] += weight
+            elif lot["status"] in {LotStatus.AT_LAUNDRY, LotStatus.WASHED}:
+                pipeline["laverie"] += weight
+            elif lot["status"] == LotStatus.IN_TRANSIT_TRANSFORMER:
+                pipeline["transit_transformateur"] += weight
+            elif lot["status"] == LotStatus.DELIVERED:
+                pipeline["livre"] += weight
         unresolved = [alert for alert in self.alerts.values() if alert["resolved_at"] is None]
-        overdue = [alert for alert in unresolved if alert["alert_type"] == AlertType.BDC_OVERDUE]
+        overdue = [alert for alert in unresolved if alert["alert_type"] in {AlertType.BDC_OVERDUE, AlertType.TRANSFORMER_CONFIRMATION_OVERDUE}]
         return {
             "active_lots": len(self.lots),
             "unresolved_alerts": len(unresolved),
@@ -1323,10 +2498,242 @@ class PlatformState:
     def update_thresholds(self, payload: ThresholdUpdate) -> dict[str, Any]:
         updates = payload.model_dump(exclude_unset=True)
         self.thresholds.update(updates)
+        self.refresh_policy_alerts()
         return deepcopy(self.thresholds)
 
     def list_lots_for_admin(self) -> list[dict[str, Any]]:
         return self.list_lots()
+
+    # QR / reporting
+    def scan_qr_payload(self, payload: QrScanRequest) -> dict[str, Any]:
+        decoded = self._validate_qr_payload(payload.qr_payload, payload.expected_ref_id, payload.expected_step)
+        scanned_hash = decoded["integrity_hash"]
+        integrity_hash = scanned_hash
+        record: dict[str, Any] = {}
+        store_verified = False
+
+        def hash_matches(stored_hash: str | None) -> bool:
+            return bool(stored_hash) and (stored_hash == scanned_hash or stored_hash.startswith(scanned_hash))
+
+        shipment = self.shipments.get(decoded["ref_id"])
+        if shipment is not None:
+            store_verified = hash_matches(shipment.get("integrity_hash"))
+            if store_verified:
+                integrity_hash = shipment["integrity_hash"]
+            record["bdc"] = {
+                "bdc_id": shipment["bdc_id"],
+                "kind": shipment["kind"],
+                "status": shipment["status"],
+                "lot_ids": shipment["lot_ids"],
+                "total_weight_kg": shipment["total_weight_kg"],
+                "humidity_pct": shipment["humidity_pct"],
+                "source_stage": shipment.get("source_stage"),
+                "destination_stage": shipment.get("destination_stage"),
+                "source_site_name": self._site_name(shipment.get("source_site_id")),
+                "destination_site_name": self._site_name(shipment.get("destination_site_id")),
+                "expected_delivery_at": shipment["expected_delivery_at"].isoformat(),
+                "pdf_url": shipment["pdf_url"],
+                "certificate_id": shipment.get("certificate_id"),
+            }
+
+        matching_events = []
+        for lot_id in decoded.get("lot_ids") or ([decoded.get("lot_id")] if decoded.get("lot_id") else []):
+            if not lot_id:
+                continue
+            for event in self.lot_events.get(lot_id, []):
+                if hash_matches(event.get("integrity_hash")):
+                    store_verified = True
+                    integrity_hash = event["integrity_hash"]
+                    matching_events.append(
+                        {
+                            "lot_id": lot_id,
+                            "event_type": event["event_type"],
+                            "actor": event["actor"],
+                            "occurred_at": event["occurred_at"].isoformat(),
+                            "details": deepcopy(event.get("details", {})),
+                        }
+                    )
+        if matching_events:
+            record["events"] = matching_events
+
+        lot_id = decoded.get("lot_id") or ((decoded.get("lot_ids") or [None])[0])
+        if lot_id in self.lots:
+            lot = self._build_stock_lot_view(lot_id)
+            record["lot"] = {
+                "lot_id": lot["lot_id"],
+                "status": lot["status"].value if hasattr(lot["status"], "value") else lot["status"],
+                "source_name": lot["source_name"],
+                "observed_weight_kg": lot["observed_weight_kg"],
+                "current_site_name": lot.get("current_site_name"),
+                "classification": lot.get("classification"),
+                "vm_percent": lot.get("vm_percent"),
+                "storage_zone": lot.get("storage_zone"),
+            }
+
+        return {
+            "valid": True,
+            "ref_id": decoded["ref_id"],
+            "step": decoded["step"],
+            "lot_id": decoded.get("lot_id"),
+            "lot_ids": decoded.get("lot_ids") or [],
+            "previous_hash": decoded.get("previous_hash"),
+            "integrity_hash": integrity_hash,
+            "produced_at": datetime.fromisoformat(decoded["produced_at"]),
+            "actor": decoded["actor"],
+            "message": "QR integrity verified against stored operator output" if store_verified else "QR signature verified; stored record not found in this environment",
+            "store_verified": store_verified,
+            "decoded_payload": decoded,
+            "record": record,
+        }
+
+    def ingest_qr_payload(self, payload: QrScanRequest, actor_email: str, role: str | None = None) -> dict[str, Any]:
+        result = self.scan_qr_payload(payload)
+        role_value = role.value if hasattr(role, "value") else role
+        step = result["step"]
+        if role_value == Role.DEPOT.value:
+            module = "depot"
+            direction = "entry"
+        elif role_value == Role.LAUNDRY.value:
+            module = "laverie"
+            direction = "entry" if step == "laundry.bdc_issued" else "qr_scan"
+        elif role_value in {Role.T1.value, Role.T2.value}:
+            module = "transformateur"
+            direction = "entry" if step == "transformer.bdc_issued" else "qr_scan"
+        else:
+            module = "admin"
+            direction = "qr_scan"
+
+        record = result.get("record", {})
+        bdc = record.get("bdc") if isinstance(record.get("bdc"), dict) else None
+        lot = record.get("lot") if isinstance(record.get("lot"), dict) else None
+        ref_type = "bdc" if bdc else "lot"
+        weight_kg = None
+        if bdc:
+            weight_kg = bdc.get("total_weight_kg")
+        elif lot:
+            weight_kg = lot.get("observed_weight_kg")
+        audit = self.record_operator_audit(
+            actor_email=actor_email,
+            module=module,
+            direction=direction,
+            action=f"qr_ingest:{step}",
+            ref_type=ref_type,
+            ref_id=result["ref_id"],
+            lot_ids=result.get("lot_ids") or ([] if result.get("lot_id") is None else [result["lot_id"]]),
+            bdc_id=result["ref_id"] if bdc else None,
+            qr_step=step,
+            qr_payload=payload.qr_payload,
+            integrity_hash=result["integrity_hash"],
+            previous_hash=result.get("previous_hash"),
+            weight_kg=weight_kg,
+            metadata={"store_verified": result["store_verified"], "decoded": result["decoded_payload"], "record": record},
+        )
+        result["audit"] = audit
+        result["message"] = f"{result['message']} + audit {audit['audit_id']} enregistre"
+        return result
+
+    def operator_report_rows(self, scope: str, site_id: str | None = None) -> list[dict[str, Any]]:
+        self.refresh_policy_alerts()
+        rows: list[dict[str, Any]] = []
+        site_lots = {
+            lot_id: lot
+            for lot_id, lot in self.lots.items()
+            if site_id is None or lot.get("current_site_id") == site_id
+        }
+        for lot_id, lot in site_lots.items():
+            classification = self.classifications.get(lot_id, {})
+            output = next((item for item in self.laundry_outputs.values() if lot_id in self.shipments.get(item["bdc_id"], {}).get("lot_ids", [])), {})
+            alerts = [alert for alert in self.alerts.values() if alert.get("lot_id") == lot_id and alert.get("resolved_at") is None]
+            last_event = self.lot_events.get(lot_id, [])[-1] if self.lot_events.get(lot_id) else {}
+            rows.append(
+                {
+                    "scope": scope,
+                    "site_id": lot.get("current_site_id"),
+                    "site_name": self._site_name(lot.get("current_site_id")),
+                    "lot_id": lot_id,
+                    "bdc_id": None,
+                    "status": lot["status"].value if hasattr(lot["status"], "value") else lot["status"],
+                    "source_id": lot["source_id"],
+                    "source_name": lot["source_name"],
+                    "observed_weight_kg": lot["observed_weight_kg"],
+                    "estimated_weight_kg": lot["estimated_weight_kg"],
+                    "total_weight_kg": lot["observed_weight_kg"],
+                    "humidity_pct": lot.get("details", {}).get("humidity_pct"),
+                    "classification": classification.get("classification"),
+                    "vm_percent": classification.get("vm_percent"),
+                    "yield_pct": output.get("yield_pct"),
+                    "mass_balance_gap_pct": output.get("mass_balance_gap_pct"),
+                    "alert_count": len(alerts),
+                    "last_event": last_event.get("event_type"),
+                    "integrity_hash": last_event.get("integrity_hash"),
+                    "age_hours": round((utcnow() - lot["created_at"]).total_seconds() / 3600, 2),
+                    "sla_max_hours": self.thresholds["lot_transformation_sla_hours"],
+                    "sla_breached": lot["status"] != LotStatus.DELIVERED and (utcnow() - lot["created_at"]).total_seconds() / 3600 > float(self.thresholds["lot_transformation_sla_hours"]),
+                    "details": self._canonical_json(lot.get("details", {})),
+                }
+            )
+        for shipment in self.list_shipments(site_id):
+            rows.append(
+                {
+                    "scope": scope,
+                    "site_id": shipment.get("destination_site_id") or shipment.get("source_site_id"),
+                    "site_name": self._site_name(shipment.get("destination_site_id") or shipment.get("source_site_id")),
+                    "lot_id": ",".join(shipment["lot_ids"]),
+                    "bdc_id": shipment["bdc_id"],
+                    "status": shipment["status"],
+                    "source_id": None,
+                    "source_name": shipment.get("laundry_name"),
+                    "observed_weight_kg": None,
+                    "estimated_weight_kg": None,
+                    "total_weight_kg": shipment["total_weight_kg"],
+                    "humidity_pct": shipment["humidity_pct"],
+                    "classification": shipment.get("kind"),
+                    "vm_percent": None,
+                    "yield_pct": None,
+                    "mass_balance_gap_pct": None,
+                    "alert_count": len([alert for alert in self.alerts.values() if alert.get("metadata", {}).get("bdc_id") == shipment["bdc_id"] and alert.get("resolved_at") is None]),
+                    "last_event": f"bdc.{shipment['status']}",
+                    "integrity_hash": shipment.get("integrity_hash"),
+                    "age_hours": round((utcnow() - shipment["created_at"]).total_seconds() / 3600, 2),
+                    "sla_max_hours": self.thresholds["bdc_overdue_hours"],
+                    "sla_breached": shipment["status"] != "closed" and shipment["expected_delivery_at"] < utcnow(),
+                    "details": self._canonical_json({"source_stage": shipment.get("source_stage"), "destination_stage": shipment.get("destination_stage"), "certificate_id": shipment.get("certificate_id")}),
+                }
+            )
+        return rows
+
+    def operator_report_csv(self, scope: str, site_id: str | None = None) -> str:
+        rows = self.operator_report_rows(scope, site_id)
+        fieldnames = [
+            "scope",
+            "site_id",
+            "site_name",
+            "lot_id",
+            "bdc_id",
+            "status",
+            "source_id",
+            "source_name",
+            "observed_weight_kg",
+            "estimated_weight_kg",
+            "total_weight_kg",
+            "humidity_pct",
+            "classification",
+            "vm_percent",
+            "yield_pct",
+            "mass_balance_gap_pct",
+            "alert_count",
+            "last_event",
+            "integrity_hash",
+            "age_hours",
+            "sla_max_hours",
+            "sla_breached",
+            "details",
+        ]
+        buffer = StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        return buffer.getvalue()
 
     # Documents
     def list_documents(self) -> list[dict[str, Any]]:
@@ -1929,15 +3336,42 @@ class PlatformState:
 
     # Events / traceability
     def publish_event(self, event_type: str, actor: str, lot_id: str | None = None, details: dict[str, Any] | None = None) -> None:
+        occurred_at = utcnow()
+        previous_hash = None
+        if lot_id is not None and self.lot_events.get(lot_id):
+            previous_hash = self.lot_events[lot_id][-1].get("integrity_hash")
+        hash_basis = {
+            "event_type": event_type,
+            "actor": actor,
+            "occurred_at": occurred_at,
+            "lot_id": lot_id,
+            "previous_hash": previous_hash,
+            "details": details or {},
+        }
+        integrity_hash = self._hmac_hex(hash_basis)
         event = {
             "event_type": event_type,
             "actor": actor,
-            "occurred_at": utcnow(),
+            "occurred_at": occurred_at,
             "lot_id": lot_id,
+            "previous_hash": previous_hash,
+            "integrity_hash": integrity_hash,
+            "qr_payload": self._build_qr_payload(
+                step=event_type,
+                ref_id=lot_id or str((details or {}).get("bdc_id") or event_type),
+                actor=actor,
+                produced_at=occurred_at,
+                previous_hash=previous_hash,
+                integrity_hash=integrity_hash,
+                lot_id=lot_id,
+                lot_ids=[lot_id] if lot_id is not None else (details or {}).get("lot_ids", []),
+            ),
             "details": details or {},
         }
         if lot_id is not None:
             self.lot_events.setdefault(lot_id, []).append(event)
+            if lot_id in self.lots:
+                self.lots[lot_id]["qr_payload"] = event["qr_payload"]
         self.evaluate_alerts(event)
 
 

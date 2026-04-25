@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 @dataclass
 class SequenceCounters:
-    user: int = 4
+    user: int = 7
     lot: int = 42
     source: int = 10
     alert: int = 1
@@ -18,6 +18,7 @@ class SequenceCounters:
     depot: int = 1
     laverie: int = 1
     transformateur: int = 1
+    site: int = 7
 
 
 def _year() -> int:
@@ -70,3 +71,7 @@ def format_laverie_id(number: int) -> str:
 
 def format_transformateur_id(number: int) -> str:
     return f"TRF-{_year()}-{number:03d}"
+
+
+def format_site_id(number: int) -> str:
+    return f"SITE-{_year()}-{number:03d}"

@@ -33,16 +33,18 @@ Mounted service paths in the dev stack:
 - `/documents`
 - `/notifications`
 
-### PostgreSQL-backed state (optional)
+### PostgreSQL-backed state
 
-By default, the backend runs with in-memory demo state. To persist state in PostgreSQL, set `DATABASE_URL` before starting the API:
+Set `DATABASE_URL` before starting the API to run the whole MVP against PostgreSQL with `psycopg`:
 
 ```powershell
 $env:DATABASE_URL = "postgresql://nfn:nfn@localhost:5432/nfn"
 .\.venv\Scripts\python.exe -m uvicorn backend.dev_stack:app --reload
 ```
 
-When enabled, backend state is saved in PostgreSQL table `app_state` (single-row snapshot keyed by `platform_state_v1`).
+When enabled, backend state is saved in PostgreSQL table `app_state` as JSONB (single-row snapshot keyed by `platform_state_v1`). This persists the shared domain engine used by auth, source, mobile, admin, operator, alert, document, and notification flows while preserving the current relational schema for the next ORM migration step.
+
+Docker Compose already passes `DATABASE_URL=postgresql://nfn:nfn@postgres:5432/nfn` to every backend service.
 
 ## Test
 
