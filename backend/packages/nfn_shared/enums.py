@@ -22,6 +22,12 @@ class LotStatus(StrEnum):
     AT_DEPOT = "at_depot"
     CLASSIFIED = "classified"
     IN_TRANSIT_LAUNDRY = "in_transit_laundry"
+    # Extended chain
+    AT_LAVERIE = "at_laverie"
+    LAVERIE_DONE = "laverie_done"
+    IN_TRANSIT_TRANSFORMATEUR = "in_transit_transformateur"
+    AT_TRANSFORMATEUR = "at_transformateur"
+    TRANSFORMED = "transformed"
 
 
 class AlertSeverity(StrEnum):
@@ -34,6 +40,11 @@ class AlertType(StrEnum):
     ESTIMATE_GAP = "estimate_gap"
     RECEIPT_GAP = "receipt_gap"
     BDC_OVERDUE = "bdc_overdue"
+    # Chain alerts
+    LAVERIE_TRANSIT_GAP = "laverie_transit_gap"        # weight mismatch depot exit → laverie entry
+    TRANSFORMATEUR_TRANSIT_GAP = "transformateur_transit_gap"  # weight mismatch laverie exit → transformateur entry
+    DEPOT_OVERDUE = "depot_overdue"                    # lot stuck in depot too long
+    LAVERIE_OVERDUE = "laverie_overdue"                # lot in laverie > threshold hours without done
 
 
 class SyncJobType(StrEnum):

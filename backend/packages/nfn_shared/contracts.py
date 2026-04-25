@@ -132,12 +132,22 @@ class ThresholdConfig(BaseModel):
     estimate_gap_pct: float
     receipt_gap_pct: float
     bdc_overdue_hours: int
+    # Chain thresholds
+    laverie_transit_gap_pct: float   # max % gap: depot exit weight → laverie entry weight
+    laverie_overdue_hours: int        # max hours lot sits in laverie without done declaration
+    depot_overdue_hours: int          # max hours lot sits in depot without departure
+    # Auto-check interval
+    alert_check_interval_minutes: int  # how often the background thread re-evaluates overdue conditions
 
 
 class ThresholdUpdate(BaseModel):
     estimate_gap_pct: float | None = None
     receipt_gap_pct: float | None = None
     bdc_overdue_hours: int | None = None
+    laverie_transit_gap_pct: float | None = None
+    laverie_overdue_hours: int | None = None
+    depot_overdue_hours: int | None = None
+    alert_check_interval_minutes: int | None = None
 
 
 class BootstrapResponse(BaseModel):
@@ -292,12 +302,22 @@ class TraceabilityEvent(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict[str, str]] = Field(default_factory=list)  # [{role, content}, ...]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+
+
 class DashboardSummary(BaseModel):
     active_lots: int
     unresolved_alerts: int
     pending_sources: int
     bdc_overdue: int
     pipeline_weights: dict[str, float]
+    last_alert_check_at: datetime | None = None   # set by background auto-check thread
 
 
 class DepotReceiptCreate(BaseModel):
@@ -401,6 +421,186 @@ class DocumentRecord(BaseModel):
     pdf_url: str
     created_at: datetime
     updated_at: datetime
+
+
+# ── Depot Sites ───────────────────────────────────────────────────────────────
+
+class DepotSiteCreate(BaseModel):
+    name: str
+    wilaya: str
+    commune: str
+    gps_lat: float
+    gps_lng: float
+    responsible_name: str
+    phone: str | None = None
+    surface_m2: float = 0.0                # surface area of the depot in m²
+    location_cost_da_per_m2: float = 0.0   # monthly rental price per m²
+
+
+class DepotSiteUpdate(BaseModel):
+    name: str | None = None
+    wilaya: str | None = None
+    commune: str | None = None
+    gps_lat: float | None = None
+    gps_lng: float | None = None
+    responsible_name: str | None = None
+    phone: str | None = None
+    surface_m2: float | None = None
+    location_cost_da_per_m2: float | None = None
+
+
+class DepotSiteView(BaseModel):
+    depot_id: str
+    name: str
+    wilaya: str
+    commune: str
+    gps_lat: float
+    gps_lng: float
+    responsible_name: str
+    phone: str | None = None
+    surface_m2: float
+    location_cost_da_per_m2: float
+    created_at: datetime
+
+
+# ── Laveries ──────────────────────────────────────────────────────────────────
+
+class LaverieCreate(BaseModel):
+    name: str
+    wilaya: str
+    commune: str
+    gps_lat: float
+    gps_lng: float
+    responsible_name: str
+    phone: str | None = None
+    cleaning_cost_per_kg_da: float = 0.0  # cost per kg of wool cleaned in DZD
+
+
+class LaverieUpdate(BaseModel):
+    name: str | None = None
+    wilaya: str | None = None
+    commune: str | None = None
+    gps_lat: float | None = None
+    gps_lng: float | None = None
+    responsible_name: str | None = None
+    phone: str | None = None
+    cleaning_cost_per_kg_da: float | None = None
+
+
+class LaverieView(BaseModel):
+    laverie_id: str
+    name: str
+    wilaya: str
+    commune: str
+    gps_lat: float
+    gps_lng: float
+    responsible_name: str
+    phone: str | None = None
+    cleaning_cost_per_kg_da: float
+    created_at: datetime
+
+
+# ── Transformateurs ───────────────────────────────────────────────────────────
+
+class TransformateurCreate(BaseModel):
+    name: str
+    wilaya: str
+    commune: str
+    gps_lat: float
+    gps_lng: float
+    responsible_name: str
+    phone: str | None = None
+    type: str = "T1"  # T1 or T2
+
+
+class TransformateurUpdate(BaseModel):
+    name: str | None = None
+    wilaya: str | None = None
+    commune: str | None = None
+    gps_lat: float | None = None
+    gps_lng: float | None = None
+    responsible_name: str | None = None
+    phone: str | None = None
+    type: str | None = None
+
+
+class TransformateurView(BaseModel):
+    transformateur_id: str
+    name: str
+    wilaya: str
+    commune: str
+    gps_lat: float
+    gps_lng: float
+    responsible_name: str
+    phone: str | None = None
+    type: str
+    created_at: datetime
+
+
+# ── Lot Chain Tracking ────────────────────────────────────────────────────────
+# Each record represents one transition in the lot's physical journey.
+# Timestamps default to utcnow() on the server if not supplied.
+
+class LotChainDepotRecord(BaseModel):
+    """Lot arrives at a depot site — records which depot and arrival weight."""
+    depot_id: str
+    arrival_weight_kg: float
+    arrival_at: datetime | None = None
+
+
+class LotChainDepotDepartureRecord(BaseModel):
+    """Lot leaves the depot toward laverie — records departure weight."""
+    departure_weight_kg: float
+    departure_at: datetime | None = None
+
+
+class LotChainLaverieRecord(BaseModel):
+    """Lot arrives at laverie — arrival weight compared with depot departure to flag transit loss."""
+    laverie_id: str
+    arrival_weight_kg: float
+    arrival_at: datetime | None = None
+
+
+class LotChainLaverieDoneRecord(BaseModel):
+    """Laverie declares lot ready (cleaned) — records exit weight after washing."""
+    exit_weight_kg: float
+    exit_at: datetime | None = None
+
+
+class LotChainTransformateurRecord(BaseModel):
+    """Lot arrives at transformateur — arrival weight compared with laverie exit."""
+    transformateur_id: str
+    arrival_weight_kg: float
+    arrival_at: datetime | None = None
+
+
+class LotChainTransformateurDoneRecord(BaseModel):
+    """Transformation complete — records exit weight."""
+    exit_weight_kg: float
+    exit_at: datetime | None = None
+
+
+class LotChainView(BaseModel):
+    """Full chain state for one lot."""
+    lot_id: str
+    # ── Depot ────────────────────────────────────────────────────────────────
+    depot_id: str | None = None
+    depot_arrival_weight_kg: float | None = None
+    depot_arrival_at: datetime | None = None
+    depot_departure_weight_kg: float | None = None
+    depot_departure_at: datetime | None = None
+    # ── Laverie ──────────────────────────────────────────────────────────────
+    laverie_id: str | None = None
+    laverie_arrival_weight_kg: float | None = None
+    laverie_arrival_at: datetime | None = None
+    laverie_exit_weight_kg: float | None = None
+    laverie_exit_at: datetime | None = None
+    # ── Transformateur ───────────────────────────────────────────────────────
+    transformateur_id: str | None = None
+    transformateur_arrival_weight_kg: float | None = None
+    transformateur_arrival_at: datetime | None = None
+    transformateur_exit_weight_kg: float | None = None
+    transformateur_exit_at: datetime | None = None
 
 
 class EmailMessageCreate(BaseModel):

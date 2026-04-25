@@ -15,6 +15,9 @@ class SequenceCounters:
     message: int = 1
     exception: int = 1
     media: int = 1
+    depot: int = 1
+    laverie: int = 1
+    transformateur: int = 1
 
 
 def _year() -> int:
@@ -55,3 +58,15 @@ def format_exception_id(number: int) -> str:
 
 def format_media_id(number: int) -> str:
     return f"MED-{_year()}-{number:04d}"
+
+
+def format_depot_id(number: int) -> str:
+    return f"DPT-{_year()}-{number:03d}"
+
+
+def format_laverie_id(number: int) -> str:
+    return f"LAV-{_year()}-{number:03d}"
+
+
+def format_transformateur_id(number: int) -> str:
+    return f"TRF-{_year()}-{number:03d}"
