@@ -99,3 +99,22 @@ def test_mobile_to_depot_flow_creates_alerts_and_bdc(client, tokens):
     )
     assert bdc.status_code == 200
     assert bdc.json()["pdf_url"].endswith(".pdf")
+
+
+def test_seed_data_covers_all_alert_types(client, tokens):
+    alerts = client.get(
+        "/admin/alerts",
+        headers={"Authorization": f"Bearer {tokens['admin']}"},
+    )
+    assert alerts.status_code == 200
+
+    alert_types = {alert["alert_type"] for alert in alerts.json()}
+    assert {
+        "estimate_gap",
+        "receipt_gap",
+        "bdc_overdue",
+        "depot_overdue",
+        "laverie_overdue",
+        "laverie_transit_gap",
+        "transformateur_transit_gap",
+    }.issubset(alert_types)

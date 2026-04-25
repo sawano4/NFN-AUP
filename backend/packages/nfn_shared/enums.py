@@ -23,6 +23,13 @@ class LotStatus(StrEnum):
     AT_DEPOT = "at_depot"
     CLASSIFIED = "classified"
     IN_TRANSIT_LAUNDRY = "in_transit_laundry"
+    # Admin chain statuses
+    AT_LAVERIE = "at_laverie"
+    LAVERIE_DONE = "laverie_done"
+    IN_TRANSIT_TRANSFORMATEUR = "in_transit_transformateur"
+    AT_TRANSFORMATEUR = "at_transformateur"
+    TRANSFORMED = "transformed"
+    # Operator chain statuses
     AT_LAUNDRY = "at_laundry"
     WASHED = "washed"
     IN_TRANSIT_TRANSFORMER = "in_transit_transformer"
@@ -39,6 +46,12 @@ class AlertType(StrEnum):
     ESTIMATE_GAP = "estimate_gap"
     RECEIPT_GAP = "receipt_gap"
     BDC_OVERDUE = "bdc_overdue"
+    # Admin chain alerts
+    LAVERIE_TRANSIT_GAP = "laverie_transit_gap"
+    TRANSFORMATEUR_TRANSIT_GAP = "transformateur_transit_gap"
+    DEPOT_OVERDUE = "depot_overdue"
+    LAVERIE_OVERDUE = "laverie_overdue"
+    # Operator chain alerts
     STOCK_TEMPERATURE = "stock_temperature"
     LAUNDRY_RECEIPT_GAP = "laundry_receipt_gap"
     LAUNDRY_YIELD_LOW = "laundry_yield_low"

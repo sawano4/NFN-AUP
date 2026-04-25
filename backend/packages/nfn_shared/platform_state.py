@@ -25,12 +25,22 @@ from .contracts import (
     DepotClassificationUpdate,
     DepotReceiptCreate,
     DepotReceiptUpdate,
+    DepotSiteCreate,
+    DepotSiteUpdate,
     DocumentCreate,
     DocumentUpdate,
     EmailMessageCreate,
     EmailMessageUpdate,
     FieldExceptionCreate,
     FieldExceptionUpdate,
+    LaverieCreate,
+    LaverieUpdate,
+    LotChainDepotDepartureRecord,
+    LotChainDepotRecord,
+    LotChainLaverieRecord,
+    LotChainLaverieDoneRecord,
+    LotChainTransformateurDoneRecord,
+    LotChainTransformateurRecord,
     LaundryOutputCreate,
     LaundryReceiptCreate,
     LotCreate,
@@ -46,6 +56,8 @@ from .contracts import (
     ThresholdUpdate,
     TransformerReceiptCreate,
     TourStop,
+    TransformateurCreate,
+    TransformateurUpdate,
     UserCreate,
     UserUpdate,
     WashRunCreate,
@@ -57,13 +69,16 @@ from .ids import (
     SequenceCounters,
     format_alert_id,
     format_bdc_id,
+    format_depot_id,
     format_document_id,
     format_exception_id,
+    format_laverie_id,
     format_lot_id,
     format_media_id,
     format_message_id,
     format_source_id,
     format_site_id,
+    format_transformateur_id,
     format_user_id,
 )
 from .sql_gateway import SqlGateway
@@ -149,6 +164,10 @@ class PlatformState:
         "storage_zones",
         "thresholds",
         "tours_by_agent",
+        "depots",
+        "laveries",
+        "transformateurs",
+        "lot_chains",
     )
 
     _PERSIST_AFTER_METHODS = {
@@ -214,6 +233,21 @@ class PlatformState:
         "update_document",
         "delete_document",
         "publish_event",
+        "create_depot",
+        "update_depot",
+        "delete_depot",
+        "create_laverie",
+        "update_laverie",
+        "delete_laverie",
+        "create_transformateur",
+        "update_transformateur",
+        "delete_transformateur",
+        "record_depot_arrival",
+        "record_depot_departure",
+        "record_laverie_arrival",
+        "record_laverie_done",
+        "record_transformateur_arrival",
+        "record_transformateur_done",
     }
 
     def __getattribute__(self, name: str) -> Any:
@@ -238,9 +272,38 @@ class PlatformState:
         self._persist_warning_emitted = False
         self.reset()
         if self._store is not None:
-            if not self._load_state():
-                self._persist_state()
+            if self._load_state():
+                # State loaded from DB — re-seed if DB was empty or stale (no lots).
+                if not self.lots:
+                    self._seed_infrastructure()
+                    self._seed_sources()
+                    self._seed_tours()
+                    self._seed_mock_lots()
+                    # Persist AFTER suspend is lifted so _persist_state actually runs.
+            else:
+                pass  # fresh DB — will persist below after suspend is lifted
         self._suspend_persist = False
+        # Persist whatever state we ended up with (seed or loaded).
+        if self._store is not None:
+            self._persist_state()
+
+    def reset_to_seed(self) -> None:
+        """Wipe all runtime state, re-apply demo seed data, and persist to DB.
+        Called by the admin /reset-demo endpoint.
+
+        Bypasses __getattribute__ wrappers via object.__getattribute__ so that
+        no partial-state persist is triggered mid-seed, and the final persist
+        is not suppressed by _suspend_persist."""
+        was_suspended = self._suspend_persist
+        self._suspend_persist = True
+        try:
+            # Call reset() directly — avoids the _PERSIST_AFTER_METHODS wrapper
+            # that would fire _persist_state() before seed data is fully built.
+            object.__getattribute__(self, "reset")()
+        finally:
+            self._suspend_persist = was_suspended
+        # Now data is fully seeded in memory — persist to DB.
+        object.__getattribute__(self, "_persist_state")()
 
     def _snapshot_state(self) -> dict[str, Any]:
         return {field_name: deepcopy(getattr(self, field_name)) for field_name in self._STATE_FIELDS}
@@ -417,10 +480,18 @@ class PlatformState:
         self.alerts: dict[str, dict[str, Any]] = {}
         self.notifications: dict[str, dict[str, Any]] = {}
         self.storage_zones = ["A1", "A2", "B1", "B2", "C1", "C2"]
+        self.depots: dict[str, dict[str, Any]] = {}
+        self.laveries: dict[str, dict[str, Any]] = {}
+        self.transformateurs: dict[str, dict[str, Any]] = {}
+        self.lot_chains: dict[str, dict[str, Any]] = {}
         self.thresholds = {
             "estimate_gap_pct": 10.0,
             "receipt_gap_pct": 5.0,
             "bdc_overdue_hours": 24,
+            "laverie_transit_gap_pct": 3.0,
+            "laverie_overdue_hours": 24,
+            "depot_overdue_hours": 48,
+            "alert_check_interval_minutes": 5,
             "stock_temperature_c": 45.0,
             "laundry_yield_tonte_pct": 53.0,
             "laundry_yield_abattage_pct": 33.0,
@@ -430,59 +501,72 @@ class PlatformState:
             "laundry_max_processing_hours": 12,
             "lot_transformation_sla_hours": 24,
         }
+        # Non-persisted runtime flag — updated by the background alert-check thread
+        self._last_alert_check_at: datetime | None = None
         self._seed_sources()
         self._seed_tours()
+        self._seed_infrastructure()
+        self._seed_mock_lots()
         if self._sql_gateway is not None:
             self._sql_gateway.reset()
 
     def _seed_sources(self) -> None:
         now = utcnow()
         seeded = [
-            {
-                "public_id": "SRC-2026-001",
-                "email": "eleveur1@example.com",
-                "source_type": "eleveur",
-                "name": "Ferme Ouled Djellal",
-                "wilaya": "Djelfa",
-                "commune": "Messaad",
-                "gps_lat": 34.154,
-                "gps_lng": 3.503,
-                "phone": None,
-                "races": ["Ouled Djellal"],
-                "herd_size": 120,
-                "availability_months": ["Mars", "Avril"],
-                "status": SourceStatus.ACTIVE,
-                "reason": None,
-                "created_at": now,
-            },
-            {
-                "public_id": "SRC-2026-002",
-                "email": "eleveur2@example.com",
-                "source_type": "eleveur",
-                "name": "Cooperative Hamra",
-                "wilaya": "Laghouat",
-                "commune": "Aflou",
-                "gps_lat": 34.111,
-                "gps_lng": 2.101,
-                "phone": None,
-                "races": ["Hamra"],
-                "herd_size": 90,
-                "availability_months": ["Avril"],
-                "status": SourceStatus.ACTIVE,
-                "reason": None,
-                "created_at": now,
-            },
+            # ── Hauts Plateaux — actifs ───────────────────────────────────────
+            {"public_id": "SRC-2026-001", "email": "bouguetaia.aissa@agri.dz",   "source_type": "eleveur",
+             "name": "Ferme Bouguetaia Aïssa",            "wilaya": "Djelfa",    "commune": "Messaad",
+             "gps_lat": 34.154, "gps_lng": 3.503, "phone": "0550 41 23 07",
+             "races": ["Ouled Djellal"], "herd_size": 145, "availability_months": ["Mars", "Avril"],
+             "status": SourceStatus.ACTIVE, "reason": None, "created_at": now - timedelta(days=60)},
+            {"public_id": "SRC-2026-002", "email": "khelil.freres@agri.dz",      "source_type": "eleveur",
+             "name": "GAEC Frères Khelil",                "wilaya": "Laghouat",  "commune": "Aflou",
+             "gps_lat": 34.111, "gps_lng": 2.101, "phone": "0661 88 54 29",
+             "races": ["Hamra"], "herd_size": 95, "availability_months": ["Avril"],
+             "status": SourceStatus.ACTIVE, "reason": None, "created_at": now - timedelta(days=55)},
+            {"public_id": "SRC-2026-003", "email": "remila.exploitation@agri.dz","source_type": "eleveur",
+             "name": "Exploitation Agropastorale Remila", "wilaya": "Tiaret",    "commune": "Frenda",
+             "gps_lat": 35.047, "gps_lng": 1.055, "phone": "0770 32 61 45",
+             "races": ["Ouled Djellal", "Rembi"], "herd_size": 210, "availability_months": ["Mars", "Avril", "Mai"],
+             "status": SourceStatus.ACTIVE, "reason": None, "created_at": now - timedelta(days=30)},
+            {"public_id": "SRC-2026-004", "email": "mekhalouf.fils@agri.dz",     "source_type": "eleveur",
+             "name": "EARL Mekhalouf & Fils",             "wilaya": "El Bayadh", "commune": "Brezina",
+             "gps_lat": 33.104, "gps_lng": 1.272, "phone": "0660 17 39 82",
+             "races": ["Ouled Djellal"], "herd_size": 175, "availability_months": ["Avril", "Mai"],
+             "status": SourceStatus.ACTIVE, "reason": None, "created_at": now - timedelta(days=25)},
+            {"public_id": "SRC-2026-005", "email": "coop.sersou@agri.dz",        "source_type": "cooperative",
+             "name": "Coopérative Agropastorale Sersou",  "wilaya": "Tiaret",    "commune": "Tiaret",
+             "gps_lat": 35.370, "gps_lng": 1.320, "phone": "046 42 15 73",
+             "races": ["Rembi"], "herd_size": 380, "availability_months": ["Mars", "Avril"],
+             "status": SourceStatus.ACTIVE, "reason": None, "created_at": now - timedelta(days=20)},
+            {"public_id": "SRC-2026-008", "email": "aures.laine@agri.dz",        "source_type": "cooperative",
+             "name": "Coopérative Aurès Laine",           "wilaya": "Batna",     "commune": "Arris",
+             "gps_lat": 35.170, "gps_lng": 6.601, "phone": "033 74 28 56",
+             "races": ["Berbère"], "herd_size": 140, "availability_months": ["Mai", "Juin"],
+             "status": SourceStatus.ACTIVE, "reason": None, "created_at": now - timedelta(days=15)},
+            # ── En attente de validation ──────────────────────────────────────
+            {"public_id": "SRC-2026-006", "email": "amrani.hamid@agri.dz",       "source_type": "eleveur",
+             "name": "Ferme Amrani Hamid",                "wilaya": "M'Sila",    "commune": "Sidi Aïssa",
+             "gps_lat": 35.882, "gps_lng": 3.770, "phone": "0550 63 17 94",
+             "races": ["Ouled Djellal"], "herd_size": 85, "availability_months": ["Avril"],
+             "status": SourceStatus.PENDING, "reason": None, "created_at": now - timedelta(days=3)},
+            {"public_id": "SRC-2026-007", "email": "eleveurs.ain-sefra@agri.dz", "source_type": "eleveur",
+             "name": "Groupement d'Éleveurs Aïn Sefra",  "wilaya": "Naâma",     "commune": "Aïn Sefra",
+             "gps_lat": 32.748, "gps_lng": -0.588, "phone": "0770 09 44 31",
+             "races": ["Hamra", "Ouled Djellal"], "herd_size": 440, "availability_months": ["Mars", "Avril", "Mai"],
+             "status": SourceStatus.PENDING, "reason": None, "created_at": now - timedelta(days=1)},
         ]
         for source in seeded:
             self.sources[source["public_id"]] = source
+        self.counters.source = 9
 
     def _seed_tours(self) -> None:
         self.tours_by_agent = {
             "agent@nfn.example.com": [
                 {
                     "source_id": "SRC-2026-001",
-                    "source_name": "Ferme Ouled Djellal",
-                    "estimated_weight_kg": 95.0,
+                    "source_name": "Ferme Bouguetaia Aïssa",
+                    "estimated_weight_kg": 320.0,
                     "wilaya": "Djelfa",
                     "gps_lat": 34.154,
                     "gps_lng": 3.503,
@@ -490,8 +574,8 @@ class PlatformState:
                 },
                 {
                     "source_id": "SRC-2026-002",
-                    "source_name": "Cooperative Hamra",
-                    "estimated_weight_kg": 72.0,
+                    "source_name": "GAEC Frères Khelil",
+                    "estimated_weight_kg": 158.0,
                     "wilaya": "Laghouat",
                     "gps_lat": 34.111,
                     "gps_lng": 2.101,
@@ -1112,6 +1196,32 @@ class PlatformState:
             if "gps" in updates:
                 lot["details"]["gps"] = updates["gps"]
         self.publish_event("lot.updated", actor=actor_email, lot_id=lot_id, details=updates)
+        # Re-evaluate weight gap whenever weights are touched so the alert fires immediately
+        if "observed_weight_kg" in updates or "estimated_weight_kg" in updates:
+            estimated = float(lot.get("estimated_weight_kg") or 0)
+            observed  = float(lot.get("observed_weight_kg")  or 0)
+            if estimated > 0:
+                delta_pct = abs(observed - estimated) / estimated * 100
+                threshold = float(self.thresholds.get("estimate_gap_pct", 10.0))
+                if delta_pct > threshold:
+                    # Only create alert if no active ESTIMATE_GAP alert exists for this lot
+                    active_for_lot = any(
+                        a["alert_type"] == AlertType.ESTIMATE_GAP
+                        and a["lot_id"] == lot_id
+                        and a["resolved_at"] is None
+                        for a in self.alerts.values()
+                    )
+                    if not active_for_lot:
+                        severity = AlertSeverity.CRITICAL if delta_pct > threshold * 2 else AlertSeverity.WARNING
+                        self.create_alert(
+                            alert_type=AlertType.ESTIMATE_GAP,
+                            severity=severity,
+                            lot_id=lot_id,
+                            message=f"Lot {lot_id} : écart estimation/collecte de {delta_pct:.1f}% après mise à jour (seuil : {threshold:.0f}%).",
+                            actors=[actor_email, "admin@nfn.example.com"],
+                            metadata={"lot_id": lot_id, "bdc_id": None, "delta_pct": round(delta_pct, 2),
+                                      "observed_weight_kg": observed, "estimated_weight_kg": estimated},
+                        )
         return deepcopy(lot)
 
     def delete_lot(self, lot_id: str) -> dict[str, str]:
@@ -1120,6 +1230,7 @@ class PlatformState:
         self.lot_events.pop(lot_id, None)
         self.receipts.pop(lot_id, None)
         self.classifications.pop(lot_id, None)
+        self.lot_chains.pop(lot_id, None)
         self._remove_alerts_for_lot(lot_id)
         for shipment in self.shipments.values():
             if lot_id in shipment["lot_ids"]:
@@ -2023,22 +2134,132 @@ class PlatformState:
     def create_manual_alert(self, payload: AlertCreate) -> dict[str, Any]:
         return self.create_alert(payload.alert_type, payload.severity, payload.lot_id, payload.message, payload.actors, payload.metadata)
 
+    def _active_alert_types_per_lot(self) -> dict[str, set[str]]:
+        """Return {lot_id: {alert_type_str, ...}} for every active (unresolved) alert."""
+        result: dict[str, set[str]] = {}
+        for alert in self.alerts.values():
+            if alert.get("resolved_at") is None and alert.get("lot_id"):
+                result.setdefault(alert["lot_id"], set()).add(str(alert.get("alert_type", "")))
+        return result
+
+    def _active_bdc_ids(self) -> set[str]:
+        """Return bdc_ids that already have an active BDC_OVERDUE alert."""
+        result: set[str] = set()
+        for alert in self.alerts.values():
+            if alert.get("resolved_at") is None and str(alert.get("alert_type", "")) == str(AlertType.BDC_OVERDUE):
+                meta = alert.get("metadata") or {}
+                if meta.get("bdc_id"):
+                    result.add(meta["bdc_id"])
+        return result
+
     def refresh_overdue_alerts(self) -> None:
-        existing = {(alert["alert_type"], alert["metadata"].get("bdc_id")) for alert in self.alerts.values() if alert["resolved_at"] is None}
-        for shipment in self.shipments.values():
-            if shipment.get("status") == "closed":
-                continue
-            if shipment["expected_delivery_at"] < utcnow():
-                alert_type = AlertType.TRANSFORMER_CONFIRMATION_OVERDUE if shipment.get("kind") == "transformer" else AlertType.BDC_OVERDUE
-                if (alert_type, shipment["bdc_id"]) not in existing:
+        now = utcnow()
+        # Pre-compute deduplication helpers (safe — never raises)
+        active_per_lot = self._active_alert_types_per_lot()
+        active_bdc_ids = self._active_bdc_ids()
+
+        # ── BDC overdue ──────────────────────────────────────────────────────
+        try:
+            for shipment in self.shipments.values():
+                if shipment.get("expected_delivery_at", now) < now and shipment["bdc_id"] not in active_bdc_ids:
                     self.create_alert(
-                        alert_type=alert_type,
+                        alert_type=AlertType.BDC_OVERDUE,
                         severity=AlertSeverity.WARNING,
-                        lot_id=shipment["lot_ids"][0] if shipment["lot_ids"] else None,
-                        message=f"BDC {shipment['bdc_id']} is overdue.",
+                        lot_id=shipment["lot_ids"][0] if shipment.get("lot_ids") else None,
+                        message=f"BDC {shipment['bdc_id']} est en retard de livraison.",
                         actors=["admin@nfn.example.com"],
-                        metadata={"bdc_id": shipment["bdc_id"], "kind": shipment.get("kind")},
+                        metadata={"bdc_id": shipment["bdc_id"], "lot_id": None},
                     )
+        except Exception:
+            logger.exception("refresh_overdue_alerts: BDC overdue check failed")
+
+        # ── Depot overdue ────────────────────────────────────────────────────
+        try:
+            depot_overdue_h = float(self.thresholds.get("depot_overdue_hours", 48))
+            for lot_id, chain in self.lot_chains.items():
+                if chain.get("depot_arrival_at") and chain.get("depot_departure_at") is None:
+                    lot = self.lots.get(lot_id)
+                    if lot and lot.get("status") in {LotStatus.AT_DEPOT, LotStatus.CLASSIFIED}:
+                        hours_in = (now - chain["depot_arrival_at"]).total_seconds() / 3600
+                        if hours_in > depot_overdue_h and str(AlertType.DEPOT_OVERDUE) not in active_per_lot.get(lot_id, set()):
+                            self.create_alert(
+                                alert_type=AlertType.DEPOT_OVERDUE,
+                                severity=AlertSeverity.WARNING,
+                                lot_id=lot_id,
+                                message=f"Lot {lot_id} stationne au dépôt depuis {hours_in:.0f}h sans départ enregistré (seuil : {depot_overdue_h:.0f}h).",
+                                actors=["admin@nfn.example.com"],
+                                metadata={"lot_id": lot_id, "bdc_id": None, "hours_in_depot": round(hours_in, 1)},
+                            )
+        except Exception:
+            logger.exception("refresh_overdue_alerts: depot overdue check failed")
+
+        # ── Laverie overdue ──────────────────────────────────────────────────
+        try:
+            laverie_overdue_h = float(self.thresholds.get("laverie_overdue_hours", 24))
+            for lot_id, chain in self.lot_chains.items():
+                if chain.get("laverie_arrival_at") and chain.get("laverie_exit_at") is None:
+                    lot = self.lots.get(lot_id)
+                    if lot and lot.get("status") == LotStatus.AT_LAVERIE:
+                        hours_in = (now - chain["laverie_arrival_at"]).total_seconds() / 3600
+                        if hours_in > laverie_overdue_h and str(AlertType.LAVERIE_OVERDUE) not in active_per_lot.get(lot_id, set()):
+                            self.create_alert(
+                                alert_type=AlertType.LAVERIE_OVERDUE,
+                                severity=AlertSeverity.WARNING,
+                                lot_id=lot_id,
+                                message=f"Lot {lot_id} est à la laverie depuis {hours_in:.0f}h sans déclaration de fin (seuil : {laverie_overdue_h:.0f}h).",
+                                actors=["admin@nfn.example.com"],
+                                metadata={"lot_id": lot_id, "bdc_id": None, "hours_in_laverie": round(hours_in, 1)},
+                            )
+        except Exception:
+            logger.exception("refresh_overdue_alerts: laverie overdue check failed")
+
+        # ── Estimate gap (collecte vs estimation) ────────────────────────────
+        try:
+            estimate_gap_pct = float(self.thresholds.get("estimate_gap_pct", 10.0))
+            for lot_id, lot in self.lots.items():
+                try:
+                    estimated = float(lot.get("estimated_weight_kg") or 0)
+                    observed  = float(lot.get("observed_weight_kg")  or 0)
+                except (TypeError, ValueError):
+                    continue
+                if estimated <= 0:
+                    continue
+                delta_pct = abs(observed - estimated) / estimated * 100
+                if delta_pct > estimate_gap_pct and str(AlertType.ESTIMATE_GAP) not in active_per_lot.get(lot_id, set()):
+                    severity = AlertSeverity.CRITICAL if delta_pct > estimate_gap_pct * 2 else AlertSeverity.WARNING
+                    self.create_alert(
+                        alert_type=AlertType.ESTIMATE_GAP,
+                        severity=severity,
+                        lot_id=lot_id,
+                        message=f"Lot {lot_id} : écart estimation/collecte de {delta_pct:.1f}% (seuil : {estimate_gap_pct:.0f}%).",
+                        actors=["admin@nfn.example.com"],
+                        metadata={"lot_id": lot_id, "bdc_id": None, "delta_pct": round(delta_pct, 2),
+                                  "observed_weight_kg": observed, "estimated_weight_kg": estimated},
+                    )
+        except Exception:
+            logger.exception("refresh_overdue_alerts: estimate gap check failed")
+
+        # ── Receipt gap (dépôt) ──────────────────────────────────────────────
+        try:
+            receipt_gap_pct = float(self.thresholds.get("receipt_gap_pct", 5.0))
+            for lot_id, receipt in self.receipts.items():
+                try:
+                    delta = abs(float(receipt.get("delta_pct") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if delta > receipt_gap_pct and str(AlertType.RECEIPT_GAP) not in active_per_lot.get(lot_id, set()):
+                    received = float(receipt.get("received_weight_kg") or 0)
+                    self.create_alert(
+                        alert_type=AlertType.RECEIPT_GAP,
+                        severity=AlertSeverity.CRITICAL,
+                        lot_id=lot_id,
+                        message=f"Lot {lot_id} : écart de réception dépôt de {delta:.1f}% (seuil : {receipt_gap_pct:.0f}%).",
+                        actors=["admin@nfn.example.com"],
+                        metadata={"lot_id": lot_id, "bdc_id": None, "delta_pct": round(delta, 2),
+                                  "received_weight_kg": received},
+                    )
+        except Exception:
+            logger.exception("refresh_overdue_alerts: receipt gap check failed")
 
     def refresh_policy_alerts(self) -> None:
         now = utcnow()
@@ -2271,6 +2492,7 @@ class PlatformState:
             "pending_sources": len([source for source in self.sources.values() if source["status"] == SourceStatus.PENDING]),
             "bdc_overdue": len(overdue),
             "pipeline_weights": pipeline,
+            "last_alert_check_at": self._last_alert_check_at,
         }
 
     def update_thresholds(self, payload: ThresholdUpdate) -> dict[str, Any]:
@@ -2545,6 +2767,572 @@ class PlatformState:
         self._get_required(self.documents, document_id, "Document")
         del self.documents[document_id]
         return {"message": f"Document {document_id} deleted"}
+
+    # ── Lot Chain Tracking ────────────────────────────────────────────────────
+
+    def _ensure_chain(self, lot_id: str) -> dict[str, Any]:
+        """Return (and create if needed) the chain record for a lot."""
+        self._get_required(self.lots, lot_id, "Lot")
+        if lot_id not in self.lot_chains:
+            self.lot_chains[lot_id] = {
+                "lot_id": lot_id,
+                "depot_id": None, "depot_arrival_weight_kg": None, "depot_arrival_at": None,
+                "depot_departure_weight_kg": None, "depot_departure_at": None,
+                "laverie_id": None, "laverie_arrival_weight_kg": None, "laverie_arrival_at": None,
+                "laverie_exit_weight_kg": None, "laverie_exit_at": None,
+                "transformateur_id": None, "transformateur_arrival_weight_kg": None, "transformateur_arrival_at": None,
+                "transformateur_exit_weight_kg": None, "transformateur_exit_at": None,
+            }
+        return self.lot_chains[lot_id]
+
+    def get_lot_chain(self, lot_id: str) -> dict[str, Any]:
+        self._get_required(self.lots, lot_id, "Lot")
+        return deepcopy(self.lot_chains.get(lot_id) or {"lot_id": lot_id})
+
+    def record_depot_arrival(self, lot_id: str, payload: LotChainDepotRecord, actor_email: str) -> dict[str, Any]:
+        chain = self._ensure_chain(lot_id)
+        self._get_required(self.depots, payload.depot_id, "Dépôt")
+        ts = payload.arrival_at or utcnow()
+        chain["depot_id"] = payload.depot_id
+        chain["depot_arrival_weight_kg"] = float(payload.arrival_weight_kg)
+        chain["depot_arrival_at"] = ts
+        self.lots[lot_id]["status"] = LotStatus.AT_DEPOT
+        self.publish_event("chain.depot_arrived", actor=actor_email, lot_id=lot_id,
+                           details={"depot_id": payload.depot_id, "arrival_weight_kg": float(payload.arrival_weight_kg)})
+        return deepcopy(chain)
+
+    def record_depot_departure(self, lot_id: str, payload: LotChainDepotDepartureRecord, actor_email: str) -> dict[str, Any]:
+        chain = self._ensure_chain(lot_id)
+        if not chain.get("depot_arrival_at"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Enregistrer d'abord l'arrivée au dépôt.")
+        ts = payload.departure_at or utcnow()
+        chain["depot_departure_weight_kg"] = float(payload.departure_weight_kg)
+        chain["depot_departure_at"] = ts
+        self.lots[lot_id]["status"] = LotStatus.IN_TRANSIT_LAUNDRY
+        self.publish_event("chain.depot_departed", actor=actor_email, lot_id=lot_id,
+                           details={"departure_weight_kg": float(payload.departure_weight_kg)})
+        return deepcopy(chain)
+
+    def record_laverie_arrival(self, lot_id: str, payload: LotChainLaverieRecord, actor_email: str) -> dict[str, Any]:
+        chain = self._ensure_chain(lot_id)
+        if not chain.get("depot_departure_at"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Enregistrer d'abord le départ du dépôt.")
+        self._get_required(self.laveries, payload.laverie_id, "Laverie")
+        ts = payload.arrival_at or utcnow()
+        chain["laverie_id"] = payload.laverie_id
+        chain["laverie_arrival_weight_kg"] = float(payload.arrival_weight_kg)
+        chain["laverie_arrival_at"] = ts
+        self.lots[lot_id]["status"] = LotStatus.AT_LAVERIE
+        # ── Weight gap alert: depot exit → laverie entry ──────────────────
+        dep_w = chain.get("depot_departure_weight_kg")
+        if dep_w and dep_w > 0:
+            gap_pct = abs(float(payload.arrival_weight_kg) - dep_w) / dep_w * 100
+            threshold = float(self.thresholds.get("laverie_transit_gap_pct", 3.0))
+            if gap_pct > threshold:
+                self.create_alert(
+                    alert_type=AlertType.LAVERIE_TRANSIT_GAP,
+                    severity=AlertSeverity.CRITICAL if gap_pct > threshold * 2 else AlertSeverity.WARNING,
+                    lot_id=lot_id,
+                    message=(f"Lot {lot_id} : écart de poids {gap_pct:.1f}% entre la sortie dépôt "
+                             f"({dep_w:.1f} kg) et l'entrée laverie ({payload.arrival_weight_kg:.1f} kg) "
+                             f"— seuil : {threshold:.1f}%."),
+                    actors=[actor_email, "admin@nfn.example.com"],
+                    metadata={"lot_id": lot_id, "bdc_id": None, "depot_departure_kg": dep_w,
+                              "laverie_arrival_kg": float(payload.arrival_weight_kg), "gap_pct": round(gap_pct, 2)},
+                )
+        self.publish_event("chain.laverie_arrived", actor=actor_email, lot_id=lot_id,
+                           details={"laverie_id": payload.laverie_id, "arrival_weight_kg": float(payload.arrival_weight_kg)})
+        return deepcopy(chain)
+
+    def record_laverie_done(self, lot_id: str, payload: LotChainLaverieDoneRecord, actor_email: str) -> dict[str, Any]:
+        chain = self._ensure_chain(lot_id)
+        if not chain.get("laverie_arrival_at"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Enregistrer d'abord l'arrivée à la laverie.")
+        ts = payload.exit_at or utcnow()
+        chain["laverie_exit_weight_kg"] = float(payload.exit_weight_kg)
+        chain["laverie_exit_at"] = ts
+        self.lots[lot_id]["status"] = LotStatus.LAVERIE_DONE
+        self.publish_event("chain.laverie_done", actor=actor_email, lot_id=lot_id,
+                           details={"exit_weight_kg": float(payload.exit_weight_kg)})
+        return deepcopy(chain)
+
+    def record_transformateur_arrival(self, lot_id: str, payload: LotChainTransformateurRecord, actor_email: str) -> dict[str, Any]:
+        chain = self._ensure_chain(lot_id)
+        if not chain.get("laverie_exit_at"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Enregistrer d'abord la fin de laverie.")
+        self._get_required(self.transformateurs, payload.transformateur_id, "Transformateur")
+        ts = payload.arrival_at or utcnow()
+        chain["transformateur_id"] = payload.transformateur_id
+        chain["transformateur_arrival_weight_kg"] = float(payload.arrival_weight_kg)
+        chain["transformateur_arrival_at"] = ts
+        self.lots[lot_id]["status"] = LotStatus.AT_TRANSFORMATEUR
+        # ── Weight gap alert: laverie exit → transformateur entry ─────────
+        lav_w = chain.get("laverie_exit_weight_kg")
+        if lav_w and lav_w > 0:
+            gap_pct = abs(float(payload.arrival_weight_kg) - lav_w) / lav_w * 100
+            threshold = float(self.thresholds.get("laverie_transit_gap_pct", 3.0))
+            if gap_pct > threshold:
+                self.create_alert(
+                    alert_type=AlertType.TRANSFORMATEUR_TRANSIT_GAP,
+                    severity=AlertSeverity.CRITICAL if gap_pct > threshold * 2 else AlertSeverity.WARNING,
+                    lot_id=lot_id,
+                    message=(f"Lot {lot_id} : écart de poids {gap_pct:.1f}% entre la sortie laverie "
+                             f"({lav_w:.1f} kg) et l'entrée transformateur ({payload.arrival_weight_kg:.1f} kg) "
+                             f"— seuil : {threshold:.1f}%."),
+                    actors=[actor_email, "admin@nfn.example.com"],
+                    metadata={"lot_id": lot_id, "bdc_id": None, "laverie_exit_kg": lav_w,
+                              "transformateur_arrival_kg": float(payload.arrival_weight_kg), "gap_pct": round(gap_pct, 2)},
+                )
+        self.publish_event("chain.transformateur_arrived", actor=actor_email, lot_id=lot_id,
+                           details={"transformateur_id": payload.transformateur_id, "arrival_weight_kg": float(payload.arrival_weight_kg)})
+        return deepcopy(chain)
+
+    def record_transformateur_done(self, lot_id: str, payload: LotChainTransformateurDoneRecord, actor_email: str) -> dict[str, Any]:
+        chain = self._ensure_chain(lot_id)
+        if not chain.get("transformateur_arrival_at"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Enregistrer d'abord l'arrivée au transformateur.")
+        ts = payload.exit_at or utcnow()
+        chain["transformateur_exit_weight_kg"] = float(payload.exit_weight_kg)
+        chain["transformateur_exit_at"] = ts
+        self.lots[lot_id]["status"] = LotStatus.TRANSFORMED
+        self.publish_event("chain.transformed", actor=actor_email, lot_id=lot_id,
+                           details={"exit_weight_kg": float(payload.exit_weight_kg)})
+        return deepcopy(chain)
+
+    def _seed_mock_lots(self) -> None:
+        """Seed realistic lots/receipts/shipments/chains so refresh_overdue_alerts
+        naturally fires ESTIMATE_GAP, RECEIPT_GAP, DEPOT_OVERDUE, LAVERIE_OVERDUE
+        and BDC_OVERDUE alerts, while chain records generate transit gap alerts
+        (LAVERIE_TRANSIT_GAP, TRANSFORMATEUR_TRANSIT_GAP) without manual alert creation.
+
+        Weight rationale (raw wool / tête / tonte):
+          Ouled Djellal ≈ 2.5 kg/tête · Rembi ≈ 2.2 kg/tête
+          Hamra ≈ 1.8 kg/tête · Berbère ≈ 1.6 kg/tête
+        """
+        now = utcnow()
+
+        # ── Lots ──────────────────────────────────────────────────────────
+        seed_lots = [
+            # LOT-001: Ferme Bouguetaia — 145 têtes OD → ~362 kg constaté,
+            #   mais estimé à 290 kg → écart 24.8 % → ESTIMATE_GAP + RECEIPT_GAP
+            {"lot_id": "LOT-2026-001",
+             "source_id": "SRC-2026-001", "source_name": "Ferme Bouguetaia Aïssa",
+             "observed_weight_kg": 362.0, "estimated_weight_kg": 290.0,
+             "status": LotStatus.AT_DEPOT,
+             "created_at": now - timedelta(days=12),
+             "details": {"cleanliness": "3", "gps": {"lat": 34.154, "lng": 3.503}}},
+
+            # LOT-002: Exploitation Remila — 210 têtes OD+Rembi → 498 kg, normal
+            {"lot_id": "LOT-2026-002",
+             "source_id": "SRC-2026-003", "source_name": "Exploitation Agropastorale Remila",
+             "observed_weight_kg": 498.0, "estimated_weight_kg": 492.0,
+             "status": LotStatus.AWAITING_DEPOT_RECEIPT,
+             "created_at": now - timedelta(days=2),
+             "details": {"cleanliness": "4", "gps": {"lat": 35.047, "lng": 1.055}}},
+
+            # LOT-003: EARL Mekhalouf — 175 têtes OD → 432 kg, au dépôt depuis 75 h
+            #   → DEPOT_OVERDUE (seuil 48 h)
+            {"lot_id": "LOT-2026-003",
+             "source_id": "SRC-2026-004", "source_name": "EARL Mekhalouf & Fils",
+             "observed_weight_kg": 432.0, "estimated_weight_kg": 428.0,
+             "status": LotStatus.AT_DEPOT,
+             "created_at": now - timedelta(days=8),
+             "details": {"cleanliness": "3", "gps": {"lat": 33.104, "lng": 1.272}}},
+
+            # LOT-004: Coopérative Sersou — 380 têtes Rembi → 646 kg, en laverie
+            #   depuis 36 h sans déclaration terminée → LAVERIE_OVERDUE (seuil 24 h)
+            {"lot_id": "LOT-2026-004",
+             "source_id": "SRC-2026-005", "source_name": "Coopérative Agropastorale Sersou",
+             "observed_weight_kg": 646.0, "estimated_weight_kg": 638.0,
+             "status": LotStatus.AT_LAVERIE,
+             "created_at": now - timedelta(days=10),
+             "details": {"cleanliness": "5", "gps": {"lat": 35.370, "lng": 1.320}}},
+
+            # LOT-005: GAEC Frères Khelil — 95 têtes Hamra → 171 kg, classifié,
+            #   fait partie d'un BDC en retard → BDC_OVERDUE
+            {"lot_id": "LOT-2026-005",
+             "source_id": "SRC-2026-002", "source_name": "GAEC Frères Khelil",
+             "observed_weight_kg": 171.0, "estimated_weight_kg": 168.0,
+             "status": LotStatus.CLASSIFIED,
+             "created_at": now - timedelta(days=14),
+             "details": {"cleanliness": "3", "gps": {"lat": 34.111, "lng": 2.101}}},
+
+            # LOT-006: Coopérative Aurès Laine — 140 têtes Berbère → 224 kg,
+            #   collecté ce matin, en transit vers dépôt
+            {"lot_id": "LOT-2026-006",
+             "source_id": "SRC-2026-008", "source_name": "Coopérative Aurès Laine",
+             "observed_weight_kg": 224.0, "estimated_weight_kg": 220.0,
+             "status": LotStatus.COLLECTED,
+             "created_at": now - timedelta(hours=18),
+             "details": {"cleanliness": "4", "gps": {"lat": 35.170, "lng": 6.601}}},
+
+            # LOT-007: Ferme Amrani — 85 têtes OD → 212 kg,
+            #   dépôt → laverie avec perte transit 6.7 % → LAVERIE_TRANSIT_GAP
+            {"lot_id": "LOT-2026-007",
+             "source_id": "SRC-2026-006", "source_name": "Ferme Amrani Hamid",
+             "observed_weight_kg": 212.0, "estimated_weight_kg": 210.0,
+             "status": LotStatus.AT_LAVERIE,
+             "created_at": now - timedelta(days=4),
+             "details": {"cleanliness": "3", "gps": {"lat": 35.882, "lng": 3.770}}},
+
+            # LOT-008: Groupement Aïn Sefra — collecte partielle, 440 têtes
+            #   Hamra+OD → 382 kg, perte laverie → transformateur 5.9 %
+            #   → TRANSFORMATEUR_TRANSIT_GAP
+            {"lot_id": "LOT-2026-008",
+             "source_id": "SRC-2026-007", "source_name": "Groupement d'Éleveurs Aïn Sefra",
+             "observed_weight_kg": 382.0, "estimated_weight_kg": 378.0,
+             "status": LotStatus.AT_TRANSFORMATEUR,
+             "created_at": now - timedelta(days=5),
+             "details": {"cleanliness": "2", "gps": {"lat": 32.748, "lng": -0.588}}},
+        ]
+        for lot in seed_lots:
+            self.lots[lot["lot_id"]] = lot
+            self.lot_events[lot["lot_id"]] = []
+        self.counters.lot = 9
+
+        # ── Réception dépôt: LOT-001 — 330 kg reçus vs 362 kg constatés
+        #    écart = 8.8 % → RECEIPT_GAP ──────────────────────────────────
+        self.receipts["LOT-2026-001"] = {
+            "lot_id": "LOT-2026-001",
+            "received_weight_kg": 330.0,
+            "storage_zone": "B3",
+            "arrival_condition": "acceptable",
+            "discrepancy_reason": "Bâches mal fixées — pertes en cours de route (RN1 Messaad–M'Sila)",
+            "delta_pct": round(abs(330.0 - 362.0) / 362.0 * 100, 2),   # ≈ 8.8 %
+            "created_at": now - timedelta(days=10),
+        }
+
+        # ── Classification pour LOT-005 (nécessaire pour l'expédition) ────
+        self.classifications["LOT-2026-005"] = {
+            "lot_id": "LOT-2026-005",
+            "classification": "Laine fine type A",
+            "vm_percent": 11.8,
+            "fiber_state": "souple",
+            "color": "blanc cassé",
+            "created_at": now - timedelta(days=12),
+        }
+
+        # ── BDC-2026-001: livraison attendue il y a 2 jours → BDC_OVERDUE ─
+        self.shipments["BDC-2026-001"] = {
+            "bdc_id": "BDC-2026-001",
+            "lot_ids": ["LOT-2026-005"],
+            "total_weight_kg": 171.0,
+            "humidity_pct": 13.2,
+            "laundry_name": "Laverie Industrielle Aïn Oussera",
+            "transporteur_email": "dispatch@transit-hoggar.dz",
+            "destination_email": "reception@trf-sba.dz",
+            "expected_delivery_at": now - timedelta(days=2),
+            "created_at": now - timedelta(days=5),
+        }
+        self.counters.shipment = 2
+
+        # ── Chaînes de traçabilité ─────────────────────────────────────────
+
+        # LOT-001: arrivé au dépôt M'Sila il y a 10 jours, non expédié
+        self.lot_chains["LOT-2026-001"] = {
+            "lot_id": "LOT-2026-001",
+            "depot_id": "DPT-2026-003",
+            "depot_arrival_weight_kg": 330.0,
+            "depot_arrival_at": now - timedelta(days=10),
+            "depot_departure_at": None,
+        }
+
+        # LOT-003: arrivé au dépôt Tiaret il y a 75 h, départ non enregistré
+        #   → DEPOT_OVERDUE
+        self.lot_chains["LOT-2026-003"] = {
+            "lot_id": "LOT-2026-003",
+            "depot_id": "DPT-2026-004",
+            "depot_arrival_weight_kg": 432.0,
+            "depot_arrival_at": now - timedelta(hours=75),
+            "depot_departure_at": None,
+        }
+
+        # LOT-004: passé par dépôt El Bayadh, en laverie depuis 36 h
+        #   sans déclaration de fin → LAVERIE_OVERDUE
+        self.lot_chains["LOT-2026-004"] = {
+            "lot_id": "LOT-2026-004",
+            "depot_id": "DPT-2026-001",
+            "depot_arrival_weight_kg": 646.0,
+            "depot_arrival_at": now - timedelta(hours=108),
+            "depot_departure_weight_kg": 644.0,
+            "depot_departure_at": now - timedelta(hours=84),
+            "laverie_id": "LAV-2026-001",
+            "laverie_arrival_weight_kg": 644.0,
+            "laverie_arrival_at": now - timedelta(hours=36),
+            "laverie_exit_at": None,
+        }
+
+        # LOT-007: dépôt Naâma → laverie, perte transit 6.7 %
+        #   (départ 212 kg, arrivée laverie 198 kg) → LAVERIE_TRANSIT_GAP
+        self.record_depot_arrival(
+            "LOT-2026-007",
+            LotChainDepotRecord(
+                depot_id="DPT-2026-002",
+                arrival_weight_kg=212.0,
+                arrival_at=now - timedelta(hours=16),
+            ),
+            actor_email="depot@nfn.dz",
+        )
+        self.record_depot_departure(
+            "LOT-2026-007",
+            LotChainDepotDepartureRecord(
+                departure_weight_kg=212.0,
+                departure_at=now - timedelta(hours=15),
+            ),
+            actor_email="depot@nfn.dz",
+        )
+        self.record_laverie_arrival(
+            "LOT-2026-007",
+            LotChainLaverieRecord(
+                laverie_id="LAV-2026-001",
+                arrival_weight_kg=198.0,        # 6.6 % de perte en transit
+                arrival_at=now - timedelta(hours=12),
+            ),
+            actor_email="depot@nfn.dz",
+        )
+
+        # LOT-008: dépôt Batna → laverie → transformateur,
+        #   perte laverie→trf 5.9 % → TRANSFORMATEUR_TRANSIT_GAP
+        self.record_depot_arrival(
+            "LOT-2026-008",
+            LotChainDepotRecord(
+                depot_id="DPT-2026-005",
+                arrival_weight_kg=382.0,
+                arrival_at=now - timedelta(hours=36),
+            ),
+            actor_email="depot@nfn.dz",
+        )
+        self.record_depot_departure(
+            "LOT-2026-008",
+            LotChainDepotDepartureRecord(
+                departure_weight_kg=380.0,
+                departure_at=now - timedelta(hours=30),
+            ),
+            actor_email="depot@nfn.dz",
+        )
+        self.record_laverie_arrival(
+            "LOT-2026-008",
+            LotChainLaverieRecord(
+                laverie_id="LAV-2026-001",
+                arrival_weight_kg=380.0,
+                arrival_at=now - timedelta(hours=28),
+            ),
+            actor_email="depot@nfn.dz",
+        )
+        self.record_laverie_done(
+            "LOT-2026-008",
+            LotChainLaverieDoneRecord(
+                exit_weight_kg=340.0,           # perte au lavage 10.5 % (normal)
+                exit_at=now - timedelta(hours=26),
+            ),
+            actor_email="laverie@nfn.dz",
+        )
+        self.record_transformateur_arrival(
+            "LOT-2026-008",
+            LotChainTransformateurRecord(
+                transformateur_id="TRF-2026-001",
+                arrival_weight_kg=320.0,        # 5.9 % de perte en transit → alerte
+                arrival_at=now - timedelta(hours=24),
+            ),
+            actor_email="trf@nfn.dz",
+        )
+
+    # ── Infrastructure seeding ────────────────────────────────────────────────
+
+    def _seed_infrastructure(self) -> None:
+        now = utcnow()
+        # 5 Dépôts
+        seed_depots = [
+            {"depot_id": "DPT-2026-001", "name": "Dépôt Central El Bayadh",
+             "wilaya": "El Bayadh",  "commune": "El Bayadh",
+             "gps_lat": 33.683, "gps_lng":  1.007,
+             "responsible_name": "Benmoussa Kaddour",
+             "phone": "049 78 14 02", "surface_m2": 2000.0, "location_cost_da_per_m2": 60.0,  "created_at": now},
+            {"depot_id": "DPT-2026-002", "name": "Dépôt Agropassoral Naâma",
+             "wilaya": "Naâma",      "commune": "Naâma",
+             "gps_lat": 33.267, "gps_lng": -0.312,
+             "responsible_name": "Tahir Lakhdar",
+             "phone": "049 52 33 67", "surface_m2": 1500.0, "location_cost_da_per_m2": 55.0,  "created_at": now},
+            {"depot_id": "DPT-2026-003", "name": "Dépôt Régional M'Sila",
+             "wilaya": "M'Sila",     "commune": "M'Sila",
+             "gps_lat": 35.705, "gps_lng":  4.544,
+             "responsible_name": "Belkacem Djilali",
+             "phone": "035 55 91 23", "surface_m2": 2500.0, "location_cost_da_per_m2": 58.0,  "created_at": now},
+            {"depot_id": "DPT-2026-004", "name": "Dépôt Sersou — Tiaret",
+             "wilaya": "Tiaret",     "commune": "Tiaret",
+             "gps_lat": 35.370, "gps_lng":  1.320,
+             "responsible_name": "Hadj Aoued Mohamed",
+             "phone": "046 41 07 58", "surface_m2": 2200.0, "location_cost_da_per_m2": 57.0,  "created_at": now},
+            {"depot_id": "DPT-2026-005", "name": "Dépôt Aurès — Batna",
+             "wilaya": "Batna",      "commune": "Batna",
+             "gps_lat": 35.555, "gps_lng":  6.174,
+             "responsible_name": "Cherif Boudissa",
+             "phone": "033 86 44 19", "surface_m2": 2800.0, "location_cost_da_per_m2": 65.0,  "created_at": now},
+        ]
+        for d in seed_depots:
+            self.depots[d["depot_id"]] = d
+        self.counters.depot = 6
+
+        # 2 Laveries
+        seed_laveries = [
+            {"laverie_id": "LAV-2026-001",
+             "name": "Laverie Industrielle Aïn Oussera",
+             "wilaya": "Djelfa", "commune": "Aïn Oussera",
+             "gps_lat": 35.082, "gps_lng": 2.908,
+             "responsible_name": "Zerrouki Hocine",
+             "phone": "027 63 22 45", "cleaning_cost_per_kg_da": 18.5, "created_at": now},
+            {"laverie_id": "LAV-2026-002",
+             "name": "Laverie Hassi Behbeh",
+             "wilaya": "Djelfa", "commune": "Hassi Behbeh",
+             "gps_lat": 34.618, "gps_lng": 3.386,
+             "responsible_name": "Ouali Moussa",
+             "phone": "027 71 08 93", "cleaning_cost_per_kg_da": 17.0, "created_at": now},
+        ]
+        for l in seed_laveries:
+            self.laveries[l["laverie_id"]] = l
+        self.counters.laverie = 3
+
+        # 2 Transformateurs
+        seed_transformateurs = [
+            {"transformateur_id": "TRF-2026-001",
+             "name": "Filature & Tissage Sidi Bel Abbès",
+             "wilaya": "Sidi Bel Abbès", "commune": "Sidi Bel Abbès",
+             "gps_lat": 35.189, "gps_lng": -0.628,
+             "responsible_name": "Benali Farouk",
+             "phone": "048 54 37 11", "type": "T1", "created_at": now},
+            {"transformateur_id": "TRF-2026-002",
+             "name": "Atelier Laineux Bouasaâda",
+             "wilaya": "M'Sila", "commune": "Bouasaâda",
+             "gps_lat": 35.213, "gps_lng": 4.175,
+             "responsible_name": "Djameleddine Rahmani",
+             "phone": "035 33 60 87", "type": "T2", "created_at": now},
+        ]
+        for t in seed_transformateurs:
+            self.transformateurs[t["transformateur_id"]] = t
+        self.counters.transformateur = 3
+
+    # ── Depot Sites ───────────────────────────────────────────────────────────
+
+    def list_depots(self) -> list[dict[str, Any]]:
+        return self._sorted_records(self.depots)
+
+    def get_depot(self, depot_id: str) -> dict[str, Any]:
+        return deepcopy(self._get_required(self.depots, depot_id, "Dépôt"))
+
+    def create_depot(self, payload: DepotSiteCreate) -> dict[str, Any]:
+        depot_id = format_depot_id(self.counters.depot)
+        self.counters.depot += 1
+        depot = {
+            "depot_id": depot_id,
+            "name": payload.name,
+            "wilaya": payload.wilaya,
+            "commune": payload.commune,
+            "gps_lat": float(payload.gps_lat),
+            "gps_lng": float(payload.gps_lng),
+            "responsible_name": payload.responsible_name,
+            "phone": payload.phone,
+            "surface_m2": float(payload.surface_m2),
+            "location_cost_da_per_m2": float(payload.location_cost_da_per_m2),
+            "created_at": utcnow(),
+        }
+        self.depots[depot_id] = depot
+        return deepcopy(depot)
+
+    def update_depot(self, depot_id: str, payload: DepotSiteUpdate) -> dict[str, Any]:
+        depot = self._get_required(self.depots, depot_id, "Dépôt")
+        updates = payload.model_dump(exclude_unset=True)
+        for key in ("name", "wilaya", "commune", "gps_lat", "gps_lng", "responsible_name", "phone", "surface_m2", "location_cost_da_per_m2"):
+            if key in updates:
+                depot[key] = updates[key]
+        return deepcopy(depot)
+
+    def delete_depot(self, depot_id: str) -> dict[str, str]:
+        self._get_required(self.depots, depot_id, "Dépôt")
+        del self.depots[depot_id]
+        return {"message": f"Dépôt {depot_id} supprimé"}
+
+    # ── Laveries ──────────────────────────────────────────────────────────────
+
+    def list_laveries(self) -> list[dict[str, Any]]:
+        return self._sorted_records(self.laveries)
+
+    def get_laverie(self, laverie_id: str) -> dict[str, Any]:
+        return deepcopy(self._get_required(self.laveries, laverie_id, "Laverie"))
+
+    def create_laverie(self, payload: LaverieCreate) -> dict[str, Any]:
+        laverie_id = format_laverie_id(self.counters.laverie)
+        self.counters.laverie += 1
+        laverie = {
+            "laverie_id": laverie_id,
+            "name": payload.name,
+            "wilaya": payload.wilaya,
+            "commune": payload.commune,
+            "gps_lat": float(payload.gps_lat),
+            "gps_lng": float(payload.gps_lng),
+            "responsible_name": payload.responsible_name,
+            "phone": payload.phone,
+            "cleaning_cost_per_kg_da": float(payload.cleaning_cost_per_kg_da),
+            "created_at": utcnow(),
+        }
+        self.laveries[laverie_id] = laverie
+        return deepcopy(laverie)
+
+    def update_laverie(self, laverie_id: str, payload: LaverieUpdate) -> dict[str, Any]:
+        laverie = self._get_required(self.laveries, laverie_id, "Laverie")
+        updates = payload.model_dump(exclude_unset=True)
+        for key in ("name", "wilaya", "commune", "gps_lat", "gps_lng", "responsible_name", "phone", "cleaning_cost_per_kg_da"):
+            if key in updates:
+                laverie[key] = updates[key]
+        return deepcopy(laverie)
+
+    def delete_laverie(self, laverie_id: str) -> dict[str, str]:
+        self._get_required(self.laveries, laverie_id, "Laverie")
+        del self.laveries[laverie_id]
+        return {"message": f"Laverie {laverie_id} supprimée"}
+
+    # ── Transformateurs ───────────────────────────────────────────────────────
+
+    def list_transformateurs(self) -> list[dict[str, Any]]:
+        return self._sorted_records(self.transformateurs)
+
+    def get_transformateur(self, transformateur_id: str) -> dict[str, Any]:
+        return deepcopy(self._get_required(self.transformateurs, transformateur_id, "Transformateur"))
+
+    def create_transformateur(self, payload: TransformateurCreate) -> dict[str, Any]:
+        transformateur_id = format_transformateur_id(self.counters.transformateur)
+        self.counters.transformateur += 1
+        transformateur = {
+            "transformateur_id": transformateur_id,
+            "name": payload.name,
+            "wilaya": payload.wilaya,
+            "commune": payload.commune,
+            "gps_lat": float(payload.gps_lat),
+            "gps_lng": float(payload.gps_lng),
+            "responsible_name": payload.responsible_name,
+            "phone": payload.phone,
+            "type": payload.type,
+            "created_at": utcnow(),
+        }
+        self.transformateurs[transformateur_id] = transformateur
+        return deepcopy(transformateur)
+
+    def update_transformateur(self, transformateur_id: str, payload: TransformateurUpdate) -> dict[str, Any]:
+        transformateur = self._get_required(self.transformateurs, transformateur_id, "Transformateur")
+        updates = payload.model_dump(exclude_unset=True)
+        for key in ("name", "wilaya", "commune", "gps_lat", "gps_lng", "responsible_name", "phone", "type"):
+            if key in updates:
+                transformateur[key] = updates[key]
+        return deepcopy(transformateur)
+
+    def delete_transformateur(self, transformateur_id: str) -> dict[str, str]:
+        self._get_required(self.transformateurs, transformateur_id, "Transformateur")
+        del self.transformateurs[transformateur_id]
+        return {"message": f"Transformateur {transformateur_id} supprimé"}
 
     # Events / traceability
     def publish_event(self, event_type: str, actor: str, lot_id: str | None = None, details: dict[str, Any] | None = None) -> None:
