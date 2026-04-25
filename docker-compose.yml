@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: nfn
       POSTGRES_DB: nfn
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backend/schema.sql:/docker-entrypoint-initdb.d/init.sql
@@ -16,7 +16,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6380:6379"
 
   minio:
     image: minio/minio:latest
@@ -25,16 +25,16 @@ services:
       MINIO_ROOT_USER: minio
       MINIO_ROOT_PASSWORD: minio123
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9002:9000"
+      - "9003:9001"
     volumes:
       - minio_data:/data
 
   mailpit:
     image: axllent/mailpit:latest
     ports:
-      - "8025:8025"
-      - "1025:1025"
+      - "8026:8025"
+      - "1026:1025"
 
   auth-service:
     build:
@@ -74,6 +74,8 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "uvicorn", "backend.services.admin_service.app.main:app", "--host", "0.0.0.0", "--port", "8104"]
+    environment:
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
     ports:
       - "8104:8104"
     depends_on:
