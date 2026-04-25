@@ -27,5 +27,8 @@ def tokens(client: TestClient) -> dict[str, str]:
     return {
         "agent": login("agent@nfn.example.com", "agent123"),
         "depot": login("depot@nfn.example.com", "depot123"),
+        "laundry": login("laundry@nfn.example.com", "laundry123"),
+        "t1": login("t1@nfn.example.com", "t1123"),
+        "t2": login("t2@nfn.example.com", "t2123"),
         "admin": login("admin@nfn.example.com", "admin123"),
     }

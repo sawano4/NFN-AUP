@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 @dataclass
 class SequenceCounters:
-    user: int = 4
+    user: int = 7
     lot: int = 42
     source: int = 10
     alert: int = 1
@@ -15,6 +15,7 @@ class SequenceCounters:
     message: int = 1
     exception: int = 1
     media: int = 1
+    site: int = 7
 
 
 def _year() -> int:
@@ -55,3 +56,7 @@ def format_exception_id(number: int) -> str:
 
 def format_media_id(number: int) -> str:
     return f"MED-{_year()}-{number:04d}"
+
+
+def format_site_id(number: int) -> str:
+    return f"SITE-{_year()}-{number:03d}"

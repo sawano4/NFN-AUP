@@ -1,0 +1,618 @@
+Vision produit
+NFN Platform est un système distribué de traçabilité et supervision composé de 4 applications distinctes connectées à un backend central. Ce n'est pas un ERP, pas un simple dashboard — c'est une infrastructure de données qui rend visible une chaîne physique opaque.
+
+Architecture globale
+┌─────────────────────────────────────────────────────────┐
+│                    NFN PLATFORM                          │
+│                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
+│  │ Mobile   │  │ Web      │  │ Web      │  │ Web    │  │
+│  │ Agent    │  │ Opérateur│  │ Admin    │  │ Source │  │
+│  │ (React   │  │ (React)  │  │ (React)  │  │ (Next) │  │
+│  │ Native)  │  │          │  │          │  │        │  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └───┬────┘  │
+│       │             │             │             │        │
+│  ─────┴─────────────┴─────────────┴─────────────┴─────  │
+│                    API Gateway (Kong / Nginx)             │
+│  ─────────────────────────────────────────────────────  │
+│       │             │             │             │        │
+│  ┌────┴──┐  ┌───────┴──┐  ┌──────┴───┐  ┌──────┴─────┐ │
+│  │ Auth  │  │ Core     │  │ Alert    │  │ Document   │ │
+│  │Service│  │ Business │  │ Engine   │  │ Service    │ │
+│  │(JWT + │  │ Service  │  │(règles + │  │(BDC PDF +  │ │
+│  │ RBAC) │  │          │  │ seuils)  │  │ QR Code)   │ │
+│  └───────┘  └──────────┘  └──────────┘  └────────────┘ │
+│                    │                                      │
+│  ┌─────────────────┴──────────────────────────────────┐  │
+│  │              PostgreSQL (données métier)            │  │
+│  │              Redis (cache + queue alertes)          │  │
+│  │              MinIO / S3 (photos, PDFs)              │  │
+│  └────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+
+Les 4 applications
+
+App 1 — Mobile Agent Collecteur (React Native)
+C'est l'application la plus critique. Elle doit fonctionner dans des conditions hostiles.
+Architecture offline-first :
+La donnée est écrite d'abord dans SQLite local, puis synchronisée vers le serveur. Jamais l'inverse. L'agent n'attend jamais le réseau pour continuer à travailler.
+Action agent
+    ↓
+SQLite local (write immédiat)
+    ↓
+Queue de synchronisation (persistante)
+    ↓
+Background sync quand réseau disponible
+    ↓
+Conflict resolution côté serveur
+Écrans principaux :
+Écran Tournée du jour — liste des collectes assignées avec carte GPS, volume estimé par source, statut (à faire / fait / exception). L'itinéraire optimisé est pré-calculé côté serveur et mis en cache local au démarrage de la journée.
+Écran Nouveau lot — Tonte — formulaire en deux étapes maximum. Étape 1 : sélection source (recherche + GPS "le plus proche"), type de toison, état de propreté avec sélecteur visuel (icônes paille / foin / peinture), date de tonte. Étape 2 : pesée (volume constaté), photo obligatoire, longueur de mèche optionnelle, taux de jarre optionnel. Génération QR code instantanée, affichage plein écran pour photo avec le téléphone du dépôt si pas d'imprimante Bluetooth.
+Écran Nouveau lot — Abattage — formulaire différent : mode d'extraction (pelade / échauffée), taux d'humidité (champ critique avec warning visuel si > seuil), présence cuir estimée, pesée.
+Écran Exception — signalement rapide avec motif (source absente / météo / route impraticable / refus) + photo + GPS. Le lot reste en statut "non collecté" et remonte dans les alertes admin.
+Écran Nouveau fournisseur — enregistrement terrain en 60 secondes : nom, téléphone, GPS automatique, type (éleveur / abattoir / tiers), race(s), estimation cheptel. Statut "en attente validation" automatique.
+Innovation 1 — Estimation intelligente du volume :
+Avant même d'arriver chez l'éleveur, l'agent voit une estimation calculée (race × têtes × poids moyen / race). Après collecte, le système compare l'estimation et le constaté et apprend — si un éleveur déclare systématiquement 100 têtes mais que les collectes donnent l'équivalent de 70 têtes, le système ajuste le coefficient pour cet éleveur spécifiquement.
+
+App 2 — Web Opérateur (React)
+Interface partagée par le responsable dépôt, le responsable laverie, et les transformateurs T1/T2. Le menu et les modules disponibles changent selon le rôle.
+Module Dépôt :
+Réception — scan QR code (webcam ou douchette USB), affichage immédiat de toutes les infos du lot collecté. Saisie du poids réel reçu. Calcul automatique de l'écart avec le volume constaté agent. Si écart > seuil : blocage avec motif obligatoire avant validation. Saisie de la zone de stockage (grille visuelle de la salle de stockage).
+Surveillance thermique — pour chaque lot en stockage humide, saisie quotidienne de la température du tas. Alerte automatique si température > seuil (risque auto-combustion).
+Classification et tri — interface de classification A/B avec critères visuels : VM% estimé (sélecteur), état fibre, couleur. Suggestion automatique de classification basée sur le type de laine et les données de collecte — le responsable valide ou corrige.
+Sortie vers laverie — sélection multi-lots depuis le stock (filtrés par classe, race, type), calcul du poids total, saisie taux d'humidité (obligatoire avant validation), génération BDC PDF automatique.
+Module Laverie :
+Réception — scan BDC, confirmation poids reçu vs poids envoyé dépôt.
+Paramètres de lavage — affichage automatique des paramètres recommandés selon la race et la destination (T1 ou T2) : température eau, type détergent, durée estimée. Ces paramètres sont éditables mais toute modification est tracée.
+Sortie laverie — saisie du bilan complet : poids net sec, poids déchets, poids eau perdue, taux humidité résiduelle (avec validation automatique 12–15%), taux suint résiduel (validation < 1%), pH, grade (1 à 5). Génération du certificat de pureté PDF + BDC vers T1 ou T2 selon grade.
+Module Transformateur :
+Réception — scan BDC, confirmation poids reçu, saisie prix DA/kg.
+Spécifique T1 — saisie flux de destination (A1/A2/A3), additifs incorporés (antimites, fibres de liaison %, ignifuge), densité et épaisseur cibles, génération numéro lot final avec traçabilité complète jusqu'à l'éleveur d'origine.
+Spécifique T2 — vérification indice de sécheresse, check corps étrangers, mode de déchargement.
+
+App 3 — Web Admin NFN (React)
+Interface de supervision pure. NFN ne saisit rien d'opérationnel ici — NFN observe, analyse, et intervient.
+Dashboard temps réel :
+Vue pipeline — représentation visuelle de la chaîne avec le volume de laine en kg à chaque étape en temps réel. Collecte → Dépôt → Laverie → T1/T2. Un seul coup d'œil suffit pour voir où la matière s'accumule ou disparaît.
+KPIs globaux — volume collecté cette semaine vs semaine précédente, taux de perte global par transition, nombre de lots actifs, nombre d'alertes non traitées, BDC en retard.
+Carte géographique — positions GPS de toutes les collectes de la journée, zones de couverture des agents, localisation des dépôts et laveries.
+Gestion des alertes :
+Chaque alerte a un type (écart poids / délai dépassé / BDC non clôturé / température stockage / humidité hors seuil / rendement lavage anormal), une sévérité (info / warning / critique), les acteurs impliqués, et un bouton "marquer comme traité" avec commentaire obligatoire. Les alertes critiques envoient aussi un SMS ou notification push aux responsables concernés.
+Validation des sources :
+Liste des inscriptions en attente avec toutes les données de la fiche, bouton valider / rejeter avec motif. Possibilité d'éditer les données avant validation.
+Traçabilité lot :
+Recherche par ID lot ou scan QR. Affichage de la timeline complète : création → collecte → dépôt → laverie → transformateur. Chaque étape montre l'acteur, le poids, l'heure, les écarts. C'est la fonctionnalité qui a le plus de valeur pour résoudre un litige.
+Rapports exportables :
+Collecte par wilaya / agent / période, rendement par laverie, bilan matière global, historique BDC par transporteur. Export CSV et PDF.
+Innovation 2 — Scoring des acteurs :
+Chaque acteur terrain (agent collecteur, responsable dépôt, laverie, transporteur) accumule un score de fiabilité basé sur ses écarts historiques. Un agent avec un taux d'écart systématiquement élevé est flagué. Un transporteur avec des BDC régulièrement en retard est dégradé dans le référentiel. Ce scoring est visible uniquement par l'admin NFN et influence les seuils d'alerte appliqués à cet acteur.
+
+App 4 — Web Source (Next.js)
+Interface publique minimaliste pour l'auto-inscription des fournisseurs.
+Formulaire en 3 étapes : type de source → informations de base → données techniques (race, cheptel, période disponibilité). Géolocalisation automatique du point GPS. Confirmation par SMS avec code OTP. Statut "en attente de validation" affiché après soumission. Notification SMS quand le compte est validé ou rejeté avec motif.
+Pas d'accès aux données de la plateforme — ce n'est pas un portail fournisseur, juste un formulaire d'entrée.
+
+Les services backend
+
+Core Business Service
+C'est le cœur du système. Il gère toutes les entités métier et les transitions d'état.
+Modèle de données central :
+Source
+  ├── type (éleveur / abattoir / tiers)
+  ├── statut (en_attente / actif / suspendu)
+  ├── races[]
+  ├── coordonnées GPS
+  └── scoring_fiabilité
+
+Lot
+  ├── id (LOT-AAAA-NNN)
+  ├── source_id
+  ├── type_laine (tonte / abattage / tiers)
+  ├── race
+  ├── statut (collecté / au_dépôt / en_transit / en_laverie / livré)
+  ├── événements[] (timeline complète)
+  └── mesures[] (toutes les pesées avec acteur + horodatage)
+
+Événement
+  ├── lot_id
+  ├── type (collecte / réception_dépôt / sortie_dépôt / ...)
+  ├── acteur_id
+  ├── poids_déclaré
+  ├── poids_mesuré
+  ├── écart_calculé
+  └── horodatage
+
+BDC (Bon de Commande)
+  ├── numéro (BDC-AAAA-NNNN)
+  ├── émetteur
+  ├── destinataire
+  ├── lots[]
+  ├── transporteur_id
+  ├── statut (émis / en_transit / clôturé)
+  └── pdf_url
+Machine à états du lot :
+Chaque lot suit une séquence stricte d'états. Une transition n'est possible que si les conditions sont remplies (BDC émis avant transfert, poids saisi avant clôture, etc.). Toute tentative de transition invalide est rejetée avec un message d'erreur explicite.
+CRÉÉ → COLLECTÉ → AU_DÉPÔT → CLASSIFIÉ → EN_TRANSIT_LAVERIE
+     → EN_LAVERIE → LAVÉ → EN_TRANSIT_TRANSFORMATEUR → LIVRÉ
+
+Alert Engine
+Service indépendant qui s'abonne aux événements du Core Service et évalue les règles d'alerte en temps réel.
+Architecture event-driven :
+Core Service publie un événement (Redis Pub/Sub)
+         ↓
+Alert Engine reçoit l'événement
+         ↓
+Évalue les règles applicables (seuils par type de laine, par acteur, par transition)
+         ↓
+Si règle déclenchée → crée une alerte en base + notification push/SMS
+Les règles sont stockées en base et configurables par l'admin NFN sans redéploiement. Chaque règle a : transition concernée, type de laine applicable, seuil numérique, sévérité, destinataires de la notification.
+Innovation 3 — Détection d'anomalies par ML :
+Après 2-3 mois de données réelles, un modèle simple (Isolation Forest ou Z-score glissant) détecte les écarts statistiquement anormaux par rapport à l'historique de chaque acteur et de chaque type de laine. Ce n'est pas un LLM — c'est un modèle léger qui tourne en batch toutes les heures et enrichit les alertes avec un score d'anomalie. Un écart de 8% qui serait sous le seuil de 10% mais qui est statistiquement 3 sigma au-dessus de la moyenne historique de cet agent déclenche quand même une alerte "anomalie statistique".
+
+Document Service
+Génère tous les documents PDF du système.
+BDC (Bon de Commande) — template HTML/CSS rendu en PDF via Puppeteer ou WeasyPrint. Contient : numéro, émetteur, destinataire, liste des lots avec poids, poids total, transporteur, délai, QR code de vérification, horodatage. Non modifiable après génération — stocké sur MinIO avec hash SHA256 pour garantir l'intégrité.
+Certificat de pureté laverie — généré à la sortie laverie. Contient tous les paramètres techniques : taux humidité, suint, pH, grade, poids net sec, références des lots sources.
+QR codes — générés à la création de chaque lot. Encodent l'ID du lot et un hash de vérification. Imprimables en Bluetooth depuis l'app mobile (format Zebra ZPL ou PDF simple).
+
+Auth Service
+JWT avec refresh tokens. RBAC (Role-Based Access Control) avec 6 rôles : agent_collecteur, responsable_dépôt, responsable_laverie, transformateur_T1, transformateur_T2, admin_NFN. Chaque rôle a une liste d'endpoints autorisés. Un responsable dépôt ne peut pas accéder aux données de la laverie et vice versa.
+
+Le workflow complet bout en bout
+1. Éleveur s'inscrit via formulaire web (App 4)
+   → Statut "en attente"
+   → Notification admin NFN
+
+2. Admin valide la fiche (App 3)
+   → Volume estimé calculé automatiquement (race × têtes × coeff)
+   → Source assignable aux tournées
+
+3. Core Service génère les tournées du lendemain (batch nocturne)
+   → Optimisation itinéraire (algo TSP simplifié sur coordonnées GPS)
+   → Push sur l'app mobile des agents concernés
+
+4. Agent collecteur part en tournée (App 1 — offline)
+   → Crée un lot par source visitée
+   → QR code généré localement
+   → Photo + GPS + pesée estimée
+   → Tout stocké en SQLite local
+
+5. Agent rentre au dépôt, réseau disponible
+   → Synchronisation automatique des lots créés offline
+   → Alert Engine compare estimé vs constaté pour chaque lot
+   → Alertes générées si écarts
+
+6. Responsable dépôt réceptionne (App 2)
+   → Scan QR → affichage infos lot
+   → Saisie poids réel → contrôle croisé automatique
+   → Classification A/B avec critères guidés
+   → Surveillance température si lot humide
+
+7. Dépôt consolide et expédie vers laverie (App 2)
+   → Sélection lots à envoyer
+   → Saisie taux d'humidité (obligatoire)
+   → BDC généré et envoyé par email au transporteur (PDF)
+   → Lots passent en statut EN_TRANSIT
+
+8. Laverie réceptionne (App 2)
+   → Scan BDC → clôture transport
+   → Poids reçu vs poids envoyé → contrôle croisé
+   → Paramètres de lavage affichés selon race et destination
+
+9. Sortie laverie (App 2)
+   → Bilan masse complet (sec + déchets + eau)
+   → Validation automatique taux humidité (12–15%) et suint (< 1%)
+   → Grade attribué → routage automatique T1 ou T2
+   → Certificat de pureté généré
+   → BDC vers transformateur
+
+10. Transformateur réceptionne (App 2)
+    → Scan BDC → confirmation poids
+    → Saisie prix DA/kg
+    → Numéro lot final généré avec traçabilité complète
+
+11. Admin NFN supervise en continu (App 3)
+    → Dashboard temps réel
+    → Alertes traitées avec commentaires
+    → Rapports générés à la demande
+
+Les innovations différenciantes
+Innovation 1 — Apprentissage des coefficients par source :
+Le volume estimé (race × têtes) est une approximation. Après chaque collecte, le système calcule l'écart entre l'estimation et le constaté pour cette source spécifique. Un coefficient de correction par source est mis à jour automatiquement. Après 3 collectes, les estimations pour un éleveur donné sont précises à ±5%. C'est un système de calibration automatique sans ML lourd — juste une moyenne glissante pondérée.
+Innovation 2 — Scoring de fiabilité des acteurs :
+Chaque acteur accumule un historique d'écarts. Le système calcule un score de fiabilité (0 à 100) basé sur la distribution de ses écarts historiques. Ce score influence dynamiquement les seuils d'alerte qui lui sont appliqués — un acteur fiable bénéficie de plus de tolérance, un acteur suspect déclenche des alertes plus tôt. C'est une forme d'apprentissage comportemental qui s'améliore avec le temps.
+Innovation 3 — Détection d'anomalies statistiques :
+Au-delà des seuils fixes, un modèle de détection d'anomalies (Z-score ou Isolation Forest léger) tourne en batch et détecte les patterns inhabituels — un collecteur dont les écarts augmentent progressivement depuis 2 semaines, une laverie dont le rendement baisse systématiquement les lundis, un transporteur avec des délais anormalement longs sur certaines routes. Ces insights enrichissent le dashboard admin avec des alertes "tendance" qui anticipent les problèmes avant qu'ils deviennent critiques.
+Innovation 4 — Traçabilité inversée jusqu'à l'éleveur :
+Le numéro de lot final généré chez T1 encode toute la chaîne. En scannant le produit fini (panneau isolant, rouleau), T1 peut remonter jusqu'à l'éleveur d'origine, la date de tonte, la race, et tous les paramètres de transformation. C'est une fonctionnalité de certification origine que les marchés européens commencent à exiger pour les matériaux biosourcés.
+Innovation 5 — Prédiction saisonnière des volumes :
+Avant la saison de tonte (mars), le système agrège les données d'inscription des éleveurs (races × têtes × période de disponibilité) et produit une carte prévisionnelle des volumes par wilaya et par semaine. NFN peut ainsi planifier ses ressources (agents, camions, capacité dépôt) avant que la saison commence. C'est un simple modèle agrégé, pas du ML — mais il a une valeur opérationnelle concrète.
+
+Stack technique recommandée pour le hackathon
+Pour la démo, l'objectif est de livrer quelque chose qui tourne réellement.
+Backend : FastAPI (Python) — rapide à écrire, documentation automatique Swagger, facile à déployer.
+Base de données : PostgreSQL avec SQLAlchemy — une seule base bien structurée suffit pour la démo.
+Cache et queues : Redis — pour les alertes en temps réel et la session.
+App mobile : React Native avec Expo — un seul codebase iOS/Android, SQLite via expo-sqlite pour l'offline, synchronisation via Axios avec retry automatique.
+Apps web : React + Vite + TailwindCSS — rapide à bootstrapper.
+QR codes : qrcode (Python côté backend), expo-camera (scan côté mobile).
+PDF : WeasyPrint (Python) pour les BDC et certificats.
+Stockage fichiers : MinIO en local (compatible S3) pour les photos et PDFs.
+Déploiement démo : Docker Compose — un seul fichier lance tout (backend, PostgreSQL, Redis, MinIO). Déployable sur Railway ou un VPS en 10 minutes.
+
+Ce que vous montrez au jury en 5 minutes
+Scénario de démo bout en bout :
+
+L'agent crée un lot sur mobile en mode offline — 90 secondes
+L'agent synchronise — les données apparaissent en temps réel sur le dashboard admin
+Le dépôt scanne le QR, saisit un poids différent → alerte générée instantanément sur le dashboard
+Le dépôt génère un BDC → PDF téléchargeable avec QR code
+L'admin ouvre la traçabilité du lot — timeline complète depuis l'éleveur avec tous les écarts calculés
+
+Pourquoi le transporteur n'a pas d'interface ?
+Le transporteur est un prestataire de service ponctuel, pas un acteur permanent de la filière. Il intervient uniquement pour déplacer physiquement la laine d'un point A à un point B. Il n'a pas de décision à prendre sur la laine, pas de données à saisir sur sa qualité, et surtout il change — ce n'est pas forcément le même transporteur à chaque trajet.
+Ce qui compte pour NFN ce n'est pas ce que fait le transporteur pendant le trajet — c'est de savoir si la laine est arrivée à destination avec le bon poids. Cette information est capturée par le destinataire (dépôt, laverie ou transformateur) qui scanne le BDC à la réception et saisit le poids reçu.
+Créer une interface transporteur ajouterait de la complexité d'onboarding (former des prestataires externes) pour une valeur faible. Le BDC PDF par email suffit pour l'informer de ce qu'il doit transporter, où et quand.
+
+Où va-t-on scanner le QR code du lot ?
+C'est une question clé. Il y a deux types de QR codes dans le système qui servent à des choses différentes.
+QR code du lot — collé physiquement sur le sac ou la balle de laine par l'agent collecteur au moment de la collecte. Ce QR code voyage avec la laine. Il est scanné par le responsable dépôt depuis l'interface web avec une webcam ou une douchette USB, pas depuis l'app mobile. L'agent n'a pas à scanner le QR du lot une fois qu'il l'a créé — il l'a généré, il sait ce qu'il contient.
+QR code du BDC — généré sur le PDF du bon de commande. Il est scanné par le destinataire (laverie, transformateur) pour clôturer le transport. Là encore depuis l'interface web.
+L'app mobile de l'agent ne sert qu'à créer les lots et générer les QR codes. Elle ne sert pas à les scanner.
+
+Est-ce qu'un lot représente toute la collecte depuis une source ?
+Non — un lot représente une collecte physique unique, pas la totalité de ce qu'un éleveur peut produire.
+Concrètement : si l'agent passe chez un éleveur en avril et récupère 80kg de tonte, c'est le LOT-2026-001. Si le même agent repasse chez le même éleveur en mai pour une deuxième tonte, c'est le LOT-2026-047. Deux lots distincts avec leurs propres QR codes, leurs propres mesures, leur propre traçabilité.
+Pourquoi ? Parce que les conditions changent entre deux collectes — état de la laine, humidité, qualité — et parce que les sacs physiques sont distincts. Le lot représente ce qui est dans les sacs à un instant donné, pas la relation commerciale avec l'éleveur sur la saison.
+L'éleveur, lui, a un profil dans le système avec l'historique de tous ses lots. L'admin peut voir la somme totale collectée chez lui sur la saison — mais ce sont plusieurs lots, pas un seul.
+
+Userflows complets par acteur
+
+Userflow 1 — Éleveur (source)
+L'éleveur interagit avec le système une seule fois — pour s'inscrire. Après ça, il ne touche plus à la plateforme.
+INSCRIPTION
+    │
+    ├── Ouvre le lien formulaire (reçu par SMS ou donné par l'agent)
+    │       ↓
+    ├── Étape 1 — Type de source
+    │   └── Sélectionne "Éleveur"
+    │       ↓
+    ├── Étape 2 — Informations de base
+    │   ├── Nom et prénom
+    │   ├── Adresse (wilaya + commune)
+    │   ├── Téléphone (servira d'identifiant)
+    │   └── GPS automatique (bouton "Utiliser ma position")
+    │       ↓
+    ├── Étape 3 — Données techniques
+    │   ├── Race(s) élevées (checkboxes : Ouled Djellal, Hamra, Rembi...)
+    │   ├── Nombre de têtes par race
+    │   └── Mois de disponibilité pour la tonte
+    │       ↓
+    ├── Confirmation OTP par SMS
+    │       ↓
+    └── Écran final : "Votre inscription est en attente de validation"
+            ↓
+        SMS reçu quand validé ou rejeté avec motif
+Points de friction à éviter : formulaire trop long, champs incompréhensibles, pas de feedback après soumission. L'éleveur doit savoir exactement ce qui se passe après.
+
+Userflow 2 — Admin NFN (validation + supervision)
+L'admin a deux modes d'utilisation — réactif (traiter ce qui remonte) et proactif (analyser et piloter).
+CONNEXION
+    │
+    └── Dashboard principal
+            │
+            ├── [MATIN] Revue quotidienne
+            │   ├── Ouvre "Alertes actives"
+            │   │   ├── Filtre par sévérité (critique en premier)
+            │   │   ├── Pour chaque alerte :
+            │   │   │   ├── Lit le détail (qui, quoi, écart)
+            │   │   │   ├── Consulte la timeline du lot concerné
+            │   │   │   └── Marque "traité" avec commentaire
+            │   │   └── Contacte l'acteur concerné si nécessaire (hors système)
+            │   │
+            │   └── Ouvre "Sources en attente de validation"
+            │       ├── Consulte chaque fiche
+            │       ├── Vérifie coordonnées GPS sur la carte
+            │       ├── [Valider] → source devient assignable
+            │       └── [Rejeter] → saisit motif → SMS envoyé à la source
+            │
+            ├── [EN CONTINU] Supervision pipeline
+            │   ├── Vue pipeline : volumes en temps réel par étape
+            │   ├── Carte géographique : collectes du jour
+            │   └── BDC en retard : transporteurs à relancer
+            │
+            └── [PÉRIODIQUE] Rapports
+                ├── Sélectionne période et type de rapport
+                ├── Génère CSV ou PDF
+                └── Télécharge ou envoie par email
+
+Userflow 3 — Agent Collecteur (cœur du système)
+C'est le userflow le plus détaillé — l'agent passe des heures sur cette app.
+DÉBUT DE JOURNÉE
+    │
+    ├── Ouvre l'app mobile
+    ├── Login (biométrique si déjà connecté)
+    ├── App télécharge la tournée du jour (si réseau disponible)
+    │   └── Si pas de réseau : charge la tournée mise en cache la veille
+    │           ↓
+    └── Écran Tournée
+        ├── Liste des sources à visiter (ordonnées par itinéraire optimisé)
+        ├── Carte avec marqueurs GPS
+        ├── Volume estimé total de la journée
+        └── Bouton "Commencer la tournée"
+
+────────────────────────────────────────
+CHEZ CHAQUE SOURCE (répété N fois)
+────────────────────────────────────────
+    │
+    ├── Arrive chez la source
+    ├── Tape sur la source dans la liste
+    │   └── Fiche source : nom, race, volume estimé, historique des collectes
+    │           ↓
+    ├── [La laine est disponible]
+    │   └── Bouton "Créer un lot"
+    │           ↓
+    │   ┌── FORMULAIRE LOT TONTE ──────────────────────────────┐
+    │   │                                                        │
+    │   │  Étape 1 — Identification                             │
+    │   │  ├── Source : pré-remplie (source sélectionnée)       │
+    │   │  ├── Date de tonte : date picker                      │
+    │   │  ├── Type de toison : [Entière] [Morceaux] [Queue]    │
+    │   │  └── Race : héritée de la fiche source                │
+    │   │                                                        │
+    │   │  Étape 2 — État et quantité                           │
+    │   │  ├── État de propreté : sélecteur visuel 1 à 5        │
+    │   │  │   avec icônes (paille / foin / peinture)           │
+    │   │  ├── Date dernier traitement antiparasitaire          │
+    │   │  ├── Poids constaté (kg) : champ numérique            │
+    │   │  │   └── Rappel volume estimé affiché en grisé        │
+    │   │  ├── Nombre de sacs + type (PP / jute)                │
+    │   │  ├── Longueur de mèche (mm) : optionnel               │
+    │   │  └── Taux de jarre (%) : optionnel                    │
+    │   │                                                        │
+    │   │  Étape 3 — Preuve                                     │
+    │   │  ├── Photo obligatoire (caméra ouvre automatiquement) │
+    │   │  ├── GPS enregistré automatiquement                   │
+    │   │  └── Note libre : optionnel                           │
+    │   │                                                        │
+    │   │  [Valider]                                             │
+    │   │      ↓                                                 │
+    │   │  ID lot généré : LOT-2026-048                          │
+    │   │  QR code affiché plein écran                          │
+    │   │  └── [Imprimer Bluetooth] ou [Photo du QR]            │
+    │   │                                                        │
+    │   └────────────────────────────────────────────────────────┘
+    │           ↓
+    │   Lot sauvegardé localement (SQLite)
+    │   Statut source : ✓ Collecté
+    │
+    ├── [La source est absente / refuse]
+    │   └── Bouton "Signaler une exception"
+    │       ├── Motif : [Absent] [Refus] [Météo] [Route] [Autre]
+    │       ├── Photo optionnelle
+    │       └── GPS automatique
+    │           ↓
+    │       Exception sauvegardée — remonte dans alertes admin
+    │
+    └── [Source inconnue rencontrée sur le terrain]
+        └── Bouton "Nouveau fournisseur"
+            ├── Nom + téléphone
+            ├── Type (éleveur / abattoir / tiers)
+            ├── GPS automatique
+            ├── Race(s) et estimation cheptel
+            └── [Enregistrer]
+                ↓
+            Statut "en attente validation" — non collectible immédiatement
+
+────────────────────────────────────────
+FIN DE JOURNÉE — RETOUR AU DÉPÔT
+────────────────────────────────────────
+    │
+    ├── Arrive au dépôt
+    ├── Réseau disponible → synchronisation automatique en arrière-plan
+    │   └── Notification : "X lots synchronisés"
+    ├── Ouvre l'écran "Livraison au dépôt"
+    │   ├── Liste des lots de la journée
+    │   ├── Confirme la livraison au dépôt
+    │   └── Signature ou validation simple
+    │           ↓
+    └── Lots passent en statut "En attente réception dépôt"
+        └── Responsable dépôt notifié
+
+Userflow 4 — Responsable Dépôt
+Le responsable dépôt a deux temps forts : réceptionner ce qui arrive et préparer ce qui part.
+RÉCEPTION DES LOTS (quand l'agent livre)
+    │
+    ├── Ouvre l'interface web — module Dépôt
+    ├── Section "Lots en attente de réception"
+    │   └── Liste des lots que l'agent a déclaré livrer
+    │           ↓
+    ├── Pour chaque sac reçu :
+    │   ├── Scan QR code (webcam ou douchette)
+    │   │   └── Fiche lot affichée : source, type, poids constaté agent, photo
+    │   ├── Pose le sac sur la balance
+    │   ├── Saisit le poids réel reçu (kg)
+    │   │       ↓
+    │   │   Calcul automatique de l'écart
+    │   │   ├── [Écart ≤ seuil] → validation directe
+    │   │   └── [Écart > seuil] → popup obligatoire
+    │   │       ├── "Écart de X% détecté"
+    │   │       ├── Motif obligatoire (humidité / sac endommagé / autre)
+    │   │       └── [Confirmer quand même] → alerte envoyée à admin
+    │   │
+    │   ├── Saisit la zone de stockage (grille visuelle de l'entrepôt)
+    │   ├── Saisit l'état à l'arrivée (correct / humide / endommagé)
+    │   └── [Valider la réception]
+    │           ↓
+    │       Lot passe en statut "Au dépôt"
+
+────────────────────────────────────────
+SURVEILLANCE DU STOCK
+────────────────────────────────────────
+    │
+    ├── Écran "Stock actuel"
+    │   ├── Liste de tous les lots présents avec zone de stockage
+    │   ├── Filtre par type / classe / race / date d'entrée
+    │   └── Pour les lots humides : saisie quotidienne température du tas
+    │           ↓
+    │       [Température > seuil] → alerte auto-combustion envoyée à admin
+
+────────────────────────────────────────
+CLASSIFICATION A/B
+────────────────────────────────────────
+    │
+    ├── Sélectionne un lot dans le stock
+    ├── Ouvre l'interface de classification
+    │   ├── VM% estimé (sélecteur visuel)
+    │   ├── État fibre (long / court / jarreuse)
+    │   ├── Couleur (blanc / beige / tâché)
+    │   └── Suggestion automatique du système basée sur les données de collecte
+    │           ↓
+    │   ├── [Valider suggestion] ou [Modifier manuellement]
+    │   └── Classe A ou B attribuée au lot
+
+────────────────────────────────────────
+EXPÉDITION VERS LAVERIE
+────────────────────────────────────────
+    │
+    ├── Ouvre "Préparer une expédition"
+    ├── Sélectionne les lots à envoyer
+    │   ├── Filtre par classe (A ou B)
+    │   ├── Filtre par race (pour optimiser les paramètres de lavage)
+    │   └── Poids total calculé automatiquement
+    │           ↓
+    ├── Saisie obligatoire : taux d'humidité global du chargement
+    │   └── [Warning si > seuil] → risque de chauffe pendant transport
+    ├── Sélectionne la laverie de destination
+    ├── Sélectionne le transporteur (depuis référentiel)
+    ├── Saisit la date/heure de livraison attendue
+    └── [Générer BDC]
+            ↓
+        PDF généré et envoyé par email au transporteur
+        Lots passent en statut "En transit vers laverie"
+        Alerte de délai programmée automatiquement
+
+Userflow 5 — Responsable Laverie
+RÉCEPTION DU CHARGEMENT
+    │
+    ├── Transporteur arrive avec le chargement
+    ├── Ouvre l'interface web — module Laverie
+    ├── Section "BDC en attente de clôture"
+    │   └── Liste des BDC actifs (transporteurs attendus)
+    │           ↓
+    ├── Scan le QR code du BDC (depuis le PDF papier du transporteur)
+    │   └── BDC affiché : lots attendus, poids déclaré dépôt, transporteur
+    ├── Saisit le poids réel reçu sur pont-bascule
+    │       ↓
+    │   Contrôle croisé automatique
+    │   ├── [Écart ≤ 5%] → BDC clôturé, lots réceptionnés
+    │   └── [Écart > 5%] → alerte critique → motif obligatoire
+    │
+    └── Lots passent en statut "En laverie"
+
+────────────────────────────────────────
+PRÉPARATION DU LAVAGE
+────────────────────────────────────────
+    │
+    ├── Sélectionne un lot ou un groupe de lots à laver
+    ├── Système affiche les paramètres recommandés
+    │   ├── Température eau (selon race et destination T1 ou T2)
+    │   ├── Type de détergent
+    │   └── Durée estimée
+    │           ↓
+    ├── Opérateur peut modifier les paramètres
+    │   └── Toute modification tracée avec motif
+    └── Lance le cycle
+
+────────────────────────────────────────
+SAISIE DE SORTIE — CERTIFICAT DE PURETÉ
+────────────────────────────────────────
+    │
+    ├── Cycle terminé
+    ├── Ouvre "Sortie laverie" pour le lot traité
+    ├── Saisit le bilan masse :
+    │   ├── Poids net sec (kg) après séchoir
+    │   ├── Poids déchets solides (kg)
+    │   └── Poids eau/humidité perdue (kg)
+    │           ↓
+    │   Contrôle automatique : entrée = sec + déchets + eau ± tolérance 2%
+    │   └── Alerte si solde inexpliqué
+    │
+    ├── Saisit les paramètres qualité :
+    │   ├── Taux humidité résiduelle (%) → validation auto 12–15%
+    │   ├── Taux suint résiduel (%) → validation auto < 1%
+    │   ├── pH → validation auto 6,5–7,5
+    │   └── Blancheur / indice jaunissement (optionnel)
+    │           ↓
+    ├── Attribue le grade (Type 1 à 5)
+    │   └── Suggestion automatique basée sur les mesures saisies
+    │           ↓
+    ├── [Valider]
+    │   └── Certificat de pureté PDF généré
+    │           ↓
+    ├── Routage automatique
+    │   ├── Types 1–2–3 → sélection T1
+    │   └── Types 4–5 → sélection T2
+    │           ↓
+    ├── Sélectionne transporteur
+    └── [Générer BDC vers transformateur]
+            ↓
+        PDF envoyé au transporteur
+        Lots en statut "En transit vers transformateur"
+
+Userflow 6 — Transformateur T1 / T2
+RÉCEPTION
+    │
+    ├── Scan QR code du BDC (PDF papier)
+    ├── Poids reçu sur balance → contrôle croisé automatique
+    └── Lots réceptionnés
+
+────────────────────────────────────────
+SPÉCIFIQUE T1
+────────────────────────────────────────
+    │
+    ├── Sélectionne le flux de production
+    │   ├── [A1] Panneaux isolants semi-rigides
+    │   ├── [A2] Rouleaux à dérouler
+    │   └── [A3] Géotextiles / feutres acoustiques
+    │           ↓
+    ├── Saisit les additifs incorporés
+    │   ├── Traitement antimites : naturel (sel de bore) / synthétique / aucun
+    │   ├── Fibres de liaison thermo-fusibles (% biopolymère)
+    │   └── Traitement ignifuge : produit utilisé
+    │           ↓
+    ├── Saisit les caractéristiques produit final
+    │   ├── Épaisseur cible (mm)
+    │   ├── Densité cible (kg/m³)
+    │   └── Prix laine reçue (DA/kg)
+    │           ↓
+    └── [Valider]
+            ↓
+        Numéro de lot final généré
+        └── Encode : lot final → lots laverie → lots dépôt → lots collecte → éleveurs d'origine
+            Traçabilité complète du produit fini jusqu'à l'éleveur
+
+────────────────────────────────────────
+SPÉCIFIQUE T2
+────────────────────────────────────────
+    │
+    ├── Checklist avant déchargement
+    │   ├── Indice de sécheresse : [OK] [Insuffisant → reporter]
+    │   └── Corps étrangers visuels : [RAS] [Présence détectée → tri manuel]
+    │           ↓
+    ├── Mode de déchargement : [Vrac] [Balles]
+    ├── Prix laine reçue (DA/kg)
+    └── [Valider réception]
+
+Ce que ces userflows révèlent comme décisions de conception
+Décision 1 — L'agent ne scan jamais. Il crée, il génère. Le scan est toujours fait par le destinataire qui reçoit physiquement la laine.
+Décision 2 — Chaque validation est irréversible. On ne supprime pas, on corrige avec motif. Ça garantit l'intégrité de l'audit trail.
+Décision 3 — Les champs critiques bloquent. Taux d'humidité avant expédition, poids reçu avant clôture BDC, motif sur écart — ces champs ne sont pas optionnels. Le workflow ne peut pas avancer sans eux.
+Décision 4 — Le système suggère, l'humain valide. Classification A/B, grade de laine, paramètres de lavage — le système propose toujours une suggestion basée sur les données disponibles. L'opérateur peut la modifier, mais la suggestion réduit les erreurs et accélère la saisie.
+Décision 5 — La traçabilité est bidirectionnelle. De l'éleveur au produit fini (forward) et du produit fini à l'éleveur (backward). Le numéro de lot final encode toute la chaîne.
+
+TOUT DOIT ETRE GEOLOCALISABLE.
+
+
+
+

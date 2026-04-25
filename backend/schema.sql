@@ -247,3 +247,17 @@ CREATE TABLE audit_log (
     ip_address INET,
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- =====================================================
+-- FULL MVP STATE SNAPSHOT
+-- =====================================================
+-- The FastAPI services share a single domain engine in nfn_shared.platform_state.
+-- This table persists the complete state with psycopg when DATABASE_URL is set.
+-- It complements the relational business tables above while the MVP still uses
+-- the shared state engine instead of a full ORM per aggregate.
+CREATE TABLE app_state (
+    state_key TEXT PRIMARY KEY,
+    state_payload JSONB,
+    payload BYTEA,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
